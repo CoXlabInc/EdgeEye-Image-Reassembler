@@ -13,7 +13,7 @@ services:
       - iotown_default
     ports:
       - 8080:8080
-    command: npm start -- -r ${REDIS_URL:-'redis://redis'}
+    command: npm start -- -r ${REDIS_URL:-redis://redis}
 
   mediamtx:
     image: iotown_image_streamer
@@ -30,6 +30,29 @@ services:
     ports:
       - 8554:8554
       - 9997:9997
+
+  edgeeye_pp:
+    container_name: edgeeye_pp
+    build:
+      context: .
+      dockerfile: Dockerfile-pp
+    restart: always
+    logging:
+      driver: "local"
+    networks:
+      - iotown_default
+    command:
+      - python3
+      - -u
+      - pp.py
+      - --url
+      - https://$IOTOWN_MESSAGE_PARSER_USER:$IOTOWN_MESSAGE_PARSER_TOKEN@iotown
+      - --mqtt_url
+      - tcp://mosquitto:8883
+      - --redis_url
+      - ${REDIS_URL:-redis://redis}
+      - --dry
+      - $IOTOWN_MESSAGE_PARSER_DRY_RUN
 
 networks:
   iotown_default:

@@ -1,0 +1,39 @@
+import argparse
+from urllib.parse import urlparse
+
+import EdgeEye
+
+import pyiotown.post
+import pyiotown.post_process
+import pyiotown.get
+
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+url = None
+dry_run = False
+
+if __name__ == '__main__':
+    app_desc = "EdgeEye Post Processor"
+
+    parser = argparse.ArgumentParser(description=app_desc)
+    parser.add_argument("--url", help="IoT.own URL", required=True)
+    parser.add_argument("--mqtt_url", help="MQTT broker URL for IoT.own", required=False, default=None)
+    parser.add_argument("--redis_url", help="Redis URL for context storage", required=False, default=None)
+    parser.add_argument('--dry', help=" Do not upload data to the server", type=int, default=0)
+    args = parser.parse_args()
+
+    print(app_desc)
+    url = args.url.strip()
+    url_parsed = urlparse(url)
+
+    print(f"URL: {url_parsed.scheme}://{url_parsed.hostname}" + (f":{url_parsed.port}" if url_parsed.port is not None else ""))
+
+    mqtt_url = args.mqtt_url.strip() if args.mqtt_url is not None else None
+        
+    if args.dry == 1:
+        dry_run = True
+        print("DRY RUNNING!")
+
+    print(f"Redis: {args.redis_url}")
+    EdgeEye.init(url, 'EdgeEye', mqtt_url, args.redis_url.strip(), dry_run=dry_run).loop_forever()

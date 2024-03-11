@@ -5,7 +5,7 @@ RUN apk add --no-cache ffmpeg
 
 WORKDIR /root/
 
-COPY . .
+COPY ./mjpeg-streamer .
 RUN npm install --only=production
 
 COPY --from=rtsp /mediamtx .
