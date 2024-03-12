@@ -10,7 +10,8 @@ from urllib.parse import urlparse
 import io
 from PIL import ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
-from PIL import Image
+from PIL import Image, ImageDraw
+import sys
 
 TAG = 'EdgeEye'
 
@@ -96,19 +97,24 @@ def post_process(message, param=None):
             prev_data = result['data'][0]['value']
             prev_data_id = result['data'][0]['_id']
             #print(f"[{TAG}] prev: {result}")
+            
             offset_next = prev_data.get('received')
             if offset_next is None:
                 offset_next = 0
+                
             if message['data']['system_voltage'] is None:
-                message['data']['system_voltage'] = result['data'][0]['value'].get('system_voltage')
-            total_size = result['data'][0]['value'].get('total_size')
-            meta = result['data'][0]['value'].get('meta_total')
+                message['data']['system_voltage'] = prev_data.get('system_voltage')
+
+            total_size = prev_data.get('total_size')
+
+            meta = prev_data.get('meta_total')
             if meta is None:
                 meta = []
         else:
             prev_data = None
             offset_next = 0
             total_size = None
+            meta = []
     except:
         prev_data = None
         offset_next = 0
@@ -151,51 +157,72 @@ def post_process(message, param=None):
     message['data']['meta_total'] = meta
     
     image_buffer_key = f"PP:EdgeEye:buffer:{message['nid']}:{epoch}"
-    rtsp_buffer_key = f"ImageToRtsp:{message['nid']}:image:buffer"
+    rtsp_buffer_key = f"ImageToRtsp:{message['nid']}:image"
+    rtsp_timestamp_key = f"ImageToRtsp:{message['nid']}:sense_time"
     rtsp_last_buffer_key = rtsp_buffer_key + ':last'
+    rtsp_last_timestamp_key = rtsp_timestamp_key + ':last'
 
     last_frag = ((flags & (1 << 1)) != 0)
     if last_frag:
         image = r.get(image_buffer_key)
         image += frag
 
-        image = image_to_jpeg(image)
-        
-        r.set(rtsp_buffer_key, image, timedelta(hours=24))
-        r.copy(image_buffer_key, rtsp_last_buffer_key, replace=True)
-        r.expire(rtsp_last_buffer_key, timedelta(hours=24))
+        try:
+            image = Image.open(io.BytesIO(image))
+        except Exception as e:
+            print(f"[{TAG}] open image error '{e}'", file=sys.stderr)
+            image = None
 
         if image is not None:
+            #Last reassembled
+            f = io.BytesIO()
+            image.save(f, 'JPEG')
+            jpeg_completed = f.getvalue()
             message['data']['image'] = {
-                'raw': image,
+                'raw': jpeg_completed,
                 'file_type': 'image',
                 'file_ext': 'jpeg',
-                'file_size': len(image),
+                'file_size': len(jpeg_completed),
             }
         
+            r.set(rtsp_last_buffer_key, jpeg_completed, timedelta(hours=24))
+            r.set(rtsp_last_timestamp_key, sense_time, timedelta(hours=24))
+            r.copy(rtsp_last_buffer_key, rtsp_buffer_key, replace=True)
+            r.expire(rtsp_buffer_key, timedelta(hours=24))
+            r.set(rtsp_timestamp_key, sense_time, timedelta(hours=24))
+            
         r.delete(image_buffer_key)
-        print(f"[{TAG}] image reassembly completed (nid:{message['nid']}, fcnt:{fcnt}, size:{len(image)})")
+        print(f"[{TAG}] image reassembly completed (nid:{message['nid']}, fcnt:{fcnt}, size:{len(jpeg_completed)})")
     else:
         r.setrange(image_buffer_key, offset, frag)
         offset += len(frag)
 
-        image = image_to_jpeg(r.get(image_buffer_key))
+        try:
+            image = Image.open(io.BytesIO(r.get(image_buffer_key)))
+        except Exception as e:
+            print(f"[{TAG}] open image error '{e}'", file=sys.stderr)
+            image = None
 
         if image is not None:
+            #Being reassembled
+            f = io.BytesIO()
+            image.save(f, 'JPEG')
+            jpeg_reassembled = f.getvalue()
             message['data']['image'] = {
-                'raw': image,
+                'raw': jpeg_reassembled,
                 'file_type': 'image',
                 'file_ext': 'jpeg',
-                'file_size': len(image),
+                'file_size': len(jpeg_reassembled),
             }
+            
+            r.set(rtsp_buffer_key, jpeg_reassembled, timedelta(hours=24))
+            r.set(rtsp_timestamp_key, sense_time, timedelta(hours=24))
+            
         message['data']['received'] = offset
         message['data']['total_size'] = total_size
 
-        r.expire(image_buffer_key, timedelta(minutes=1))
+        r.expire(image_buffer_key, timedelta(hours=1))
         print(f"[{TAG}] image reassembly in progress (nid:{message['nid']}, fcnt:{fcnt}, +{len(frag)} bytes, {offset}/{total_size} ({(offset / total_size * 100) if total_size > 0 else 0:.2f}%))")
-
-        r.copy(image_buffer_key, rtsp_buffer_key, replace=True)
-        r.expire(rtsp_buffer_key, timedelta(hours=24))
 
     r.delete(mutex_key)
     
@@ -204,13 +231,3 @@ def post_process(message, param=None):
         #print(f"[{TAG}] delete prev data _id:${prev_data_id}: {result}")
         
     return message
-
-def image_to_jpeg(image_data):
-    try:
-        image = Image.open(io.BytesIO(image_data))
-        f = io.BytesIO()
-        image.save(f, "JPEG")
-        return f.getvalue()
-    except Exception as e:
-        print(f"[{TAG}] open image error '{e}'")
-        return None

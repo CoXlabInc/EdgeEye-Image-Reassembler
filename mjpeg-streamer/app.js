@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+// -*- mode: js; js-indent-level: 4; indent-tabs-mode:nil; -*-
 
 import os from 'os';
 import http from 'http';
@@ -40,7 +40,7 @@ try {
     process.exit(1);
 }
 
-async function sendAnImage(res, bufferKey, lastOffset) {
+async function sendAnImage(res, bufferKey, timestampKey) {
     if (res.writableEnded) {
         return;
     }
@@ -50,31 +50,53 @@ async function sendAnImage(res, bufferKey, lastOffset) {
     }), bufferKey);
     
     if (buffer.length > 0) {
+        let image;
+        
         res.write('Content-Type: image/jpeg\r\n');
-	try {
-	    buffer = await sharp(buffer, { failOn: 'none' }).jpeg().toBuffer();
-	} catch(e) {
+	      try {
+	          image = sharp(buffer, { failOn: 'none' });
+	      } catch(e) {
             console.error(e);
             buffer = await redisClient.GET(redis.commandOptions({
                 returnBuffers: true
             }), bufferKey + ':last');
 
             try {
-                buffer = await sharp(buffer, { failOn: 'none' }).jpeg().toBuffer();
+                image = sharp(buffer, { failOn: 'none' });
             } catch(e) {
                 console.error(e);
             }
-	}
+	      }
 
+        let timestamp = new Date(await redisClient.GET(timestampKey));
+        console.log(timestamp);
+
+        // Intl?
+        timestamp = timestamp.toLocaleString(
+            'ko-KR',
+            { timeZone: "KST", timeZoneName: 'short' }
+        );
+
+        buffer = await image.composite([{
+            input: {
+                text: {
+                    text: timestamp,
+                    width: 640,
+                    height: 30,
+                    align: "left",
+                }
+            },
+            top:0,
+            left:0
+        }]).jpeg().toBuffer();
+        
         res.write(`Content-Length: ${buffer.length}\r\n\r\n`);
         res.write(buffer, 'binary');
         console.log(`Load and write data ${buffer.length}`);
         res.write('\r\n--' + boundaryID + '\r\n');
     }
 
-    setTimeout(sendAnImage,
-               (lastOffset === buffer.length) ? 1000 : 100,
-               res, bufferKey, buffer.length);
+    setTimeout(sendAnImage, 1000, res, bufferKey, timestampKey);
 };
 
 /**
@@ -103,12 +125,21 @@ var server = http.createServer(async (req, res) => {
     };
 
     // for image requests, return a HTTP multipart document (stream)
-    let uri = req.url.split('/').slice(1);
+    let uri = req.url.split('?');
+    let path = uri[0].split('/').slice(1);
+    let params = new URLSearchParams(uri[1]);
+    
+    if (path.length == 2) {
+        const device = path[0];
+        const time = path[1];
+        
+        let bufferKey = `ImageToRtsp:${device}:image`;
+        let timestampKey = `ImageToRtsp:${device}:sense_time`;
 
-    if (uri.length == 2) {
-        const device = uri[0];
-        const key = uri[1];
-        const bufferKey = `ImageToRtsp:${device}:${key}:buffer`;
+        if (time == 'last') {
+            bufferKey += ':last';
+            timestampKey += ':last';
+        }
         
         let bufferLength = await redisClient.STRLEN(bufferKey);
         if (bufferLength == 0) {
@@ -127,7 +158,7 @@ var server = http.createServer(async (req, res) => {
             console.log('writing header');
 
             res.write('--' + boundaryID + '\r\n');
-            await sendAnImage(res, bufferKey);
+            await sendAnImage(res, bufferKey, timestampKey);
         }
 
         res.on('close', function() {
