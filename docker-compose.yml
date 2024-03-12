@@ -1,7 +1,7 @@
 version: '3.5'
 
 services:
-  iotown_image_streamer:
+  iotown_mjpeg_streamer:
     image: iotown_image_streamer
     build:
       context: .

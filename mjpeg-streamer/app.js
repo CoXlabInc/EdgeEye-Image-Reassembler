@@ -2,7 +2,7 @@
 
 import os from 'os';
 import http from 'http';
-import PubSub from 'pubsub-js';
+import sharp from 'sharp';
 
 import { Command } from 'commander';
 const program = new Command();
@@ -45,23 +45,36 @@ async function sendAnImage(res, bufferKey, lastOffset) {
         return;
     }
     
-    let bufferLength = await redisClient.STRLEN(bufferKey);
-    if (bufferLength > 0) {
+    let buffer = await redisClient.GET(redis.commandOptions({
+        returnBuffers: true
+    }), bufferKey);
+    
+    if (buffer.length > 0) {
         res.write('Content-Type: image/jpeg\r\n');
-        res.write('Content-Length: ' + bufferLength + '\r\n');
-        res.write("\r\n");
+	try {
+	    buffer = await sharp(buffer, { failOn: 'none' }).jpeg().toBuffer();
+	} catch(e) {
+            console.error(e);
+            buffer = await redisClient.GET(redis.commandOptions({
+                returnBuffers: true
+            }), bufferKey + ':last');
 
-        let data = await redisClient.GET(redis.commandOptions({
-            returnBuffers: true
-        }), bufferKey);
-        res.write(data, 'binary');
-        console.log(`Load and write data ${data.length}`);
-        res.write("\r\n");
-        res.write('--' + boundaryID + '\r\n');
-        console.log('End of streaming');
+            try {
+                buffer = await sharp(buffer, { failOn: 'none' }).jpeg().toBuffer();
+            } catch(e) {
+                console.error(e);
+            }
+	}
+
+        res.write(`Content-Length: ${buffer.length}\r\n\r\n`);
+        res.write(buffer, 'binary');
+        console.log(`Load and write data ${buffer.length}`);
+        res.write('\r\n--' + boundaryID + '\r\n');
     }
 
-    setTimeout(sendAnImage, (lastOffset === bufferLength) ? 1000 : 100, res, bufferKey, bufferLength);
+    setTimeout(sendAnImage,
+               (lastOffset === buffer.length) ? 1000 : 100,
+               res, bufferKey, buffer.length);
 };
 
 /**

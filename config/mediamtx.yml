@@ -461,7 +461,10 @@ paths:
     runOnRead:
     # Restart the command if it exits.
     runOnReadRestart: no
+    
   ~^(LW[A-Fa-f0-9]{16})\/([A-Za-z0-9]\w*):
-    runOnDemand: ffmpeg -re -i http://iotown_image_streamer:8080/$G1/$G2 -f rtsp rtsp://localhost:$RTSP_PORT/$G1/$G2
+    runOnDemand: ffmpeg -re -i http://iotown_mjpeg_streamer:8080/$G1/$G2 -f rtsp rtsp://localhost:$RTSP_PORT/$G1/$G2
     runOnDemandRestart: yes
     runOnDemandStartTimeout: 600s
+    readUser: admin
+    readPass: admin
