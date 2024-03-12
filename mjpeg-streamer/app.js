@@ -40,7 +40,7 @@ try {
     process.exit(1);
 }
 
-async function sendAnImage(res, bufferKey, timestampKey) {
+async function sendAnImage(res, bufferKey, timestampKey, locale, timezone, height) {
     if (res.writableEnded) {
         return;
     }
@@ -68,21 +68,17 @@ async function sendAnImage(res, bufferKey, timestampKey) {
             }
 	      }
 
-        let timestamp = new Date(await redisClient.GET(timestampKey));
-        console.log(timestamp);
+        const metadata = await image.metadata();
 
-        // Intl?
-        timestamp = timestamp.toLocaleString(
-            'ko-KR',
-            { timeZone: "Asia/Seoul" }
-        );
+        let timestamp = new Date(await redisClient.GET(timestampKey));
+        timestamp = timestamp.toLocaleString(locale, { timeZone: timezone });
 
         buffer = await image.composite([{
             input: {
                 text: {
                     text: timestamp,
-                    width: 640,
-                    height: 30,
+                    width: metadata.width,
+                    height: height,
                     align: "left",
                 }
             },
@@ -96,7 +92,7 @@ async function sendAnImage(res, bufferKey, timestampKey) {
         res.write('\r\n--' + boundaryID + '\r\n');
     }
 
-    setTimeout(sendAnImage, 1000, res, bufferKey, timestampKey);
+    setTimeout(sendAnImage, 1000, res, bufferKey, timestampKey, locale, timezone, height);
 };
 
 /**
@@ -129,14 +125,13 @@ var server = http.createServer(async (req, res) => {
     let path = uri[0].split('/').slice(1);
     let params = new URLSearchParams(uri[1]);
     
-    if (path.length == 2) {
+    if (path.length <= 2) {
         const device = path[0];
-        const time = path[1];
         
         let bufferKey = `ImageToRtsp:${device}:image`;
         let timestampKey = `ImageToRtsp:${device}:sense_time`;
 
-        if (time == 'last') {
+        if (path.length == 2 && path[1] == 'last') {
             bufferKey += ':last';
             timestampKey += ':last';
         }
@@ -158,7 +153,22 @@ var server = http.createServer(async (req, res) => {
             console.log('writing header');
 
             res.write('--' + boundaryID + '\r\n');
-            await sendAnImage(res, bufferKey, timestampKey);
+
+            let locale = params.get('locale');
+            if (locale == null) {
+                locale = Intl.DateTimeFormat().resolvedOptions().locale;
+            }
+            let timezone = params.get('timezone');
+            if (timezone == null) {
+                timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+            }
+            let height = params.get('height');
+            try {
+                height = parseInt(height);
+            } catch {
+                height = 30;
+            }
+            await sendAnImage(res, bufferKey, timestampKey, locale, timezone, height);
         }
 
         res.on('close', function() {
