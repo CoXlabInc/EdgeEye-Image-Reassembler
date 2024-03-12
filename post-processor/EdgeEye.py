@@ -72,15 +72,19 @@ def post_process(message, param=None):
     #TODO length check
 
     fcnt = message['meta'].get('fCnt')
-    epoch = int.from_bytes(raw[0:5], 'little', signed=False)
-    offset = int.from_bytes(raw[6:8], 'little', signed=False)
-    flags = raw[8]
-    frag = raw[9:]
-
+    flags = raw[0]
     epoch = int.from_bytes(raw[1:6], 'little', signed=False)
-    sense_time = datetime.utcfromtimestamp(epoch).isoformat() + 'Z'
+    offset = int.from_bytes(raw[6:9], 'little', signed=False)
+    if (flags & (1 << 2)) == 0:
+        sysv = None
+        frag = raw[9:]
+    else:
+        sysv = int.from_bytes(raw[9:11], 'little', signed=False) / 1000.0
+        frag = raw[11:]
 
+    sense_time = datetime.utcfromtimestamp(epoch).isoformat() + 'Z'
     message['data']['sense_time'] = sense_time
+    message['data']['system_voltage'] = sysv
 
     result = pyiotown.get.storage(iotown_url, iotown_token,
                                   message['nid'],
@@ -95,6 +99,8 @@ def post_process(message, param=None):
             offset_next = prev_data.get('received')
             if offset_next is None:
                 offset_next = 0
+            if message['data']['system_voltage'] is None:
+                message['data']['system_voltage'] = result['data'][0]['value'].get('system_voltage')
         else:
             prev_data = None
             offset_next = 0
@@ -103,13 +109,12 @@ def post_process(message, param=None):
         offset_next = 0
 
     total_size_key = f"PP:EdgeEye:size:{message['nid']}:{epoch}"
-    first_frag = (((raw[0] >> 0) & (1 << 0)) != 0)
+    first_frag = ((flags & (1 << 0)) != 0)
     if first_frag:
+        total_size = offset
         offset = 0
-        total_size = int.from_bytes(raw[6:9], 'little', signed=False)
         r.set(total_size_key, total_size)
     else:
-        offset = int.from_bytes(raw[6:9], 'little', signed=False)
         total_size = r.get(total_size_key)
         if total_size is not None:
             total_size = int(total_size)
@@ -151,10 +156,10 @@ def post_process(message, param=None):
     rtsp_buffer_key = f"ImageToRtsp:{message['nid']}:image:buffer"
     rtsp_last_buffer_key = rtsp_buffer_key + ':last'
 
-    last_frag = (((raw[0] >> 0) & (1 << 1)) != 0)
+    last_frag = ((flags & (1 << 1)) != 0)
     if last_frag:
         image = r.get(image_buffer_key)
-        image += raw[9:]
+        image += frag
 
         image = image_to_jpeg(image)
         
@@ -175,8 +180,8 @@ def post_process(message, param=None):
         r.delete(total_size_key)
         print(f"[{TAG}] image reassembly completed (nid:{message['nid']}, fcnt:{fcnt}, size:{len(image)})")
     else:
-        r.setrange(image_buffer_key, offset, raw[9:])
-        offset += len(raw) - 9
+        r.setrange(image_buffer_key, offset, frag)
+        offset += len(frag)
 
         image = image_to_jpeg(r.get(image_buffer_key))
 
@@ -193,7 +198,7 @@ def post_process(message, param=None):
         r.expire(image_buffer_key, timedelta(minutes=1))
         r.expire(meta_key, timedelta(minutes=1))
         r.expire(total_size_key, timedelta(minutes=1))
-        print(f"[{TAG}] image reassembly in progress (nid:{message['nid']}, fcnt:{fcnt}, +{len(raw) - 9} bytes, {offset}/{total_size} ({(offset / total_size * 100) if total_size > 0 else 0}))")
+        print(f"[{TAG}] image reassembly in progress (nid:{message['nid']}, fcnt:{fcnt}, +{len(frag)} bytes, {offset}/{total_size} ({(offset / total_size * 100) if total_size > 0 else 0:.2f}%))")
 
         r.copy(image_buffer_key, rtsp_buffer_key, replace=True)
         r.expire(rtsp_buffer_key, timedelta(hours=24))

@@ -5,7 +5,7 @@ RUN apk add --no-cache nodejs
 RUN python3 -m pip install redis
 RUN python3 -m pip install pillow
 RUN python3 -m pip install numpy
-RUN python3 -m pip install pyiotown==0.5.0
+RUN python3 -m pip install pyiotown==0.5.1
 
 COPY ./post-processor .
 
