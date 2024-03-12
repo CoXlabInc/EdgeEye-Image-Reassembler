@@ -101,20 +101,25 @@ def post_process(message, param=None):
                 offset_next = 0
             if message['data']['system_voltage'] is None:
                 message['data']['system_voltage'] = result['data'][0]['value'].get('system_voltage')
+            total_size = result['data'][0]['value'].get('total_size')
+            meta = result['data'][0]['value'].get('meta_total')
+            if meta is None:
+                meta = []
         else:
             prev_data = None
             offset_next = 0
+            total_size = None
     except:
         prev_data = None
         offset_next = 0
 
-    total_size_key = f"PP:EdgeEye:size:{message['nid']}:{epoch}"
     first_frag = ((flags & (1 << 0)) != 0)
     if first_frag:
         total_size = offset
         offset = 0
-        r.set(total_size_key, total_size)
-    else:
+    elif total_size is None:
+        # to keep backward compatible
+        total_size_key = f"PP:EdgeEye:size:{message['nid']}:{epoch}"
         total_size = r.get(total_size_key)
         if total_size is not None:
             total_size = int(total_size)
@@ -138,13 +143,6 @@ def post_process(message, param=None):
                                   verify=False)
         r.delete(mutex_key)
         return None
-
-    meta_key = f"PP:EdgeEye:meta:{message['nid']}:{epoch}"
-    meta = r.get(meta_key)
-    if meta is None:
-        meta = []
-    else:
-        meta = json.loads(meta.decode('ascii'))
 
     l = message['meta']
     del l['raw']
@@ -176,8 +174,6 @@ def post_process(message, param=None):
             }
         
         r.delete(image_buffer_key)
-        r.delete(meta_key)
-        r.delete(total_size_key)
         print(f"[{TAG}] image reassembly completed (nid:{message['nid']}, fcnt:{fcnt}, size:{len(image)})")
     else:
         r.setrange(image_buffer_key, offset, frag)
@@ -193,11 +189,9 @@ def post_process(message, param=None):
                 'file_size': len(image),
             }
         message['data']['received'] = offset
+        message['data']['total_size'] = total_size
 
-        r.set(meta_key, json.dumps(meta))
         r.expire(image_buffer_key, timedelta(minutes=1))
-        r.expire(meta_key, timedelta(minutes=1))
-        r.expire(total_size_key, timedelta(minutes=1))
         print(f"[{TAG}] image reassembly in progress (nid:{message['nid']}, fcnt:{fcnt}, +{len(frag)} bytes, {offset}/{total_size} ({(offset / total_size * 100) if total_size > 0 else 0:.2f}%))")
 
         r.copy(image_buffer_key, rtsp_buffer_key, replace=True)
