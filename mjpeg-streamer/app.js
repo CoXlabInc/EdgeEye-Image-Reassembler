@@ -74,7 +74,7 @@ async function sendAnImage(res, bufferKey, timestampKey) {
         // Intl?
         timestamp = timestamp.toLocaleString(
             'ko-KR',
-            { timeZone: "KST", timeZoneName: 'short' }
+            { timeZone: "Asia/Seoul" }
         );
 
         buffer = await image.composite([{
