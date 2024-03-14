@@ -53,9 +53,9 @@ async function sendAnImage(res, bufferKey, timestampKey, locale, timezone, heigh
         let image;
         
         res.write('Content-Type: image/jpeg\r\n');
-	      try {
-	          image = sharp(buffer, { failOn: 'none' });
-	      } catch(e) {
+        try {
+            image = sharp(buffer, { failOn: 'none' });
+        } catch(e) {
             console.error(e);
             buffer = await redisClient.GET(redis.commandOptions({
                 returnBuffers: true
@@ -66,10 +66,9 @@ async function sendAnImage(res, bufferKey, timestampKey, locale, timezone, heigh
             } catch(e) {
                 console.error(e);
             }
-	      }
+        }
 
         const metadata = await image.metadata();
-
         let timestamp = new Date(await redisClient.GET(timestampKey));
         timestamp = timestamp.toLocaleString(locale, { timeZone: timezone });
 
@@ -162,12 +161,11 @@ var server = http.createServer(async (req, res) => {
             if (timezone == null) {
                 timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
             }
-            let height = params.get('height');
-            try {
-                height = parseInt(height);
-            } catch {
+            let height = parseInt(params.get('height'));
+            if (isNaN(height)) {
                 height = 30;
             }
+            
             await sendAnImage(res, bufferKey, timestampKey, locale, timezone, height);
         }
 

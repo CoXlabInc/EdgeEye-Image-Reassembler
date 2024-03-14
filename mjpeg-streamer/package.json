@@ -20,7 +20,7 @@
   "homepage": "https://bitbucket.org/coxlab/iot.own-image-to-rtsp-streamer#readme",
   "dependencies": {
     "commander": "^10.0.1",
-    "sharp": "^0.32.1",
+    "sharp": "^0.33.2",
     "redis": "^4.6.7"
   }
 }
