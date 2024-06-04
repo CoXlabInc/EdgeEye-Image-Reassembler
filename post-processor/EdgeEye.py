@@ -118,6 +118,8 @@ def post_process(message, param=None):
     except:
         prev_data = None
         offset_next = 0
+        total_size = None
+        meta = []
 
     first_frag = ((flags & (1 << 0)) != 0)
     if first_frag:
@@ -197,8 +199,10 @@ def post_process(message, param=None):
         r.setrange(image_buffer_key, offset, frag)
         offset += len(frag)
 
+        jpeg_raw = r.get(image_buffer_key)
+
         try:
-            image = Image.open(io.BytesIO(r.get(image_buffer_key)))
+            image = Image.open(io.BytesIO(jpeg_raw))
         except Exception as e:
             print(f"[{TAG}] open image error '{e}'", file=sys.stderr)
             image = None
@@ -217,7 +221,14 @@ def post_process(message, param=None):
             
             r.set(rtsp_buffer_key, jpeg_reassembled, timedelta(hours=24))
             r.set(rtsp_timestamp_key, sense_time, timedelta(hours=24))
-            
+        else:
+            message['data']['image'] = {
+                'raw': jpeg_raw,
+                'file_type': 'image',
+                'file_ext': 'jpeg',
+                'file_size': len(jpeg_raw),
+            }
+
         message['data']['received'] = offset
         message['data']['total_size'] = total_size
 

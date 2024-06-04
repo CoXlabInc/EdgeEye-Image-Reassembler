@@ -1,5 +1,3 @@
-version: '3.5'
-
 services:
   iotown_mjpeg_streamer:
     image: iotown_image_streamer
