@@ -76,16 +76,27 @@ def post_process(message, param=None):
     flags = raw[0]
     epoch = int.from_bytes(raw[1:6], 'little', signed=False)
     offset = int.from_bytes(raw[6:9], 'little', signed=False)
+
+    i = 9
+    
     if (flags & (1 << 2)) == 0:
         sysv = None
-        frag = raw[9:]
     else:
-        sysv = int.from_bytes(raw[9:11], 'little', signed=False) / 1000.0
-        frag = raw[11:]
+        sysv = int.from_bytes(raw[i:i+2], 'little', signed=False) / 1000.0
+        i += 2
+
+    if (flags & (1 << 3)) == 0:
+        als = None
+    else:
+        als = int.from_bytes(raw[i:i+3], 'little', signed=False)
+        i += 3
+
+    frag = raw[i:]
 
     sense_time = datetime.utcfromtimestamp(epoch).isoformat() + 'Z'
     message['data']['sense_time'] = sense_time
     message['data']['system_voltage'] = sysv
+    message['data']['ambient_light_lux'] = als
 
     result = pyiotown.get.storage(iotown_url, iotown_token,
                                   message['nid'],
