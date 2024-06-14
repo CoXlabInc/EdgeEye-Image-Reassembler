@@ -113,8 +113,10 @@ def post_process(message, param=None):
             if offset_next is None:
                 offset_next = 0
                 
-            if message['data']['system_voltage'] is None:
+            if message['data'].get('system_voltage') is None:
                 message['data']['system_voltage'] = prev_data.get('system_voltage')
+            if message['data'].get('ambient_light_lux') is None:
+                message['data']['ambient_light_lux'] = prev_data.get('ambient_light_lux')
 
             total_size = prev_data.get('total_size')
 
@@ -126,7 +128,8 @@ def post_process(message, param=None):
             offset_next = 0
             total_size = None
             meta = []
-    except:
+    except Exception as e:
+        print(f"[{TAG}] {e}")
         prev_data = None
         offset_next = 0
         total_size = None
