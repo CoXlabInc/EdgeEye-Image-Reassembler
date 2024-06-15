@@ -40,6 +40,11 @@ def init(url, pp_name, mqtt_url, redis_url, dry_run=False):
     return pyiotown.post_process.connect_common(url, pp_name, post_process, mqtt_url, dry_run=dry_run)
     
 def post_process(message, param=None):
+    fport = [1, 2, 3]
+
+    if message['meta'].get('fPort') not in fport:
+        return message
+    
     raw = message['meta'].get('raw')
     
     if raw is None:
@@ -101,12 +106,13 @@ def post_process(message, param=None):
     result = pyiotown.get.storage(iotown_url, iotown_token,
                                   message['nid'],
                                   group_id=message['grpid'],
-                                  count=1,
+                                  count=10,
                                   verify=False)
-    try:
-        if result['data'][0]['value']['sense_time'] == sense_time:
-            prev_data = result['data'][0]['value']
-            prev_data_id = result['data'][0]['_id']
+    prev_data = None
+    for i in range(len(result['data'])):
+        if result['data'][i]['value'].get('fPort') == fport and result['data'][i]['value'].get('sense_time') == sense_time:
+            prev_data = result['data'][i]['value']
+            prev_data_id = result['data'][i]['_id']
             #print(f"[{TAG}] prev: {result}")
             
             offset_next = prev_data.get('received')
@@ -123,14 +129,9 @@ def post_process(message, param=None):
             meta = prev_data.get('meta_total')
             if meta is None:
                 meta = []
-        else:
-            prev_data = None
-            offset_next = 0
-            total_size = None
-            meta = []
-    except Exception as e:
-        print(f"[{TAG}] {e}")
-        prev_data = None
+            break
+
+    if prev_data is None:
         offset_next = 0
         total_size = None
         meta = []
