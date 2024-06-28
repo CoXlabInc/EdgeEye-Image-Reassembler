@@ -67,7 +67,33 @@ def post_process(message, param=None):
     if fport == 2:
         # Fail Report
         if raw[0] == 0:
-            message['data']['error'] = "Snap failed"
+            message['data']['error'] = "Camera boot failed"
+            if raw[1] == 1:
+                message['data']['error_sub'] = 'File system error'
+            elif raw[1] == 2:
+                message['data']['error_sub'] = 'Memory error'
+            elif raw[1] == 3:
+                message['data']['error_sub'] = 'Sensor error'
+            else:
+                message['data']['error_sub'] = raw[1]
+        elif raw[0] == 1:
+            message['data']['error'] = "Camera snap failed"
+            if raw[1] == 0:
+                message['data']['error_sub'] = 'Memory error'
+            elif raw[1] == 1:
+                message['data']['error_sub'] = 'File system error'
+            elif raw[1] == 2:
+                message['data']['error_sub'] = 'Encoding error'
+            else:
+                message['data']['error_sub'] = raw[1]
+        elif raw[0] == 2:
+            message['data']['error'] = "Send failed"
+            if raw[1] == 1:
+                message['data']['error_sub'] = 'File system error'
+            elif raw[1] == 2:
+                message['data']['error_sub'] = 'Too busy'
+            else:
+                message['data']['error_sub'] = raw[1]
         else:
             message['data']['error'] = f"Unknown fail ({raw[0]})"
         return message
