@@ -208,34 +208,35 @@ def post_process(message, param=None):
     last_frag = ((flags & (1 << 1)) != 0)
     if last_frag:
         image = r.get(image_buffer_key)
-        image += frag
-
-        try:
-            image = Image.open(io.BytesIO(image))
-        except Exception as e:
-            print(f"[{TAG}] open image error '{e}'", file=sys.stderr)
-            image = None
-
         if image is not None:
-            #Last reassembled
-            f = io.BytesIO()
-            image.save(f, 'JPEG')
-            jpeg_completed = f.getvalue()
-            message['data']['image'] = {
-                'raw': jpeg_completed,
-                'file_type': 'image',
-                'file_ext': 'jpeg',
-                'file_size': len(jpeg_completed),
-            }
+            image += frag
+
+            try:
+                image = Image.open(io.BytesIO(image))
+            except Exception as e:
+                print(f"[{TAG}] open image error '{e}'", file=sys.stderr)
+                image = None
+
+            if image is not None:
+                #Last reassembled
+                f = io.BytesIO()
+                image.save(f, 'JPEG')
+                jpeg_completed = f.getvalue()
+                message['data']['image'] = {
+                    'raw': jpeg_completed,
+                    'file_type': 'image',
+                    'file_ext': 'jpeg',
+                    'file_size': len(jpeg_completed),
+                }
         
-            r.set(rtsp_last_buffer_key, jpeg_completed, timedelta(hours=24))
-            r.set(rtsp_last_timestamp_key, sense_time, timedelta(hours=24))
-            r.copy(rtsp_last_buffer_key, rtsp_buffer_key, replace=True)
-            r.expire(rtsp_buffer_key, timedelta(hours=24))
-            r.set(rtsp_timestamp_key, sense_time, timedelta(hours=24))
+                r.set(rtsp_last_buffer_key, jpeg_completed, timedelta(hours=24))
+                r.set(rtsp_last_timestamp_key, sense_time, timedelta(hours=24))
+                r.copy(rtsp_last_buffer_key, rtsp_buffer_key, replace=True)
+                r.expire(rtsp_buffer_key, timedelta(hours=24))
+                r.set(rtsp_timestamp_key, sense_time, timedelta(hours=24))
             
-        r.delete(image_buffer_key)
-        print(f"[{TAG}] image reassembly completed (nid:{message['nid']}, fcnt:{fcnt}, size:{len(jpeg_completed)})")
+            r.delete(image_buffer_key)
+            print(f"[{TAG}] image reassembly completed (nid:{message['nid']}, fcnt:{fcnt}, size:{len(jpeg_completed)})")
     else:
         r.setrange(image_buffer_key, offset, frag)
         offset += len(frag)
