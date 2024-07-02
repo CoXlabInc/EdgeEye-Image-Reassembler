@@ -92,6 +92,8 @@ def post_process(message, param=None):
                 message['data']['error_sub'] = 'File system error'
             elif raw[1] == 2:
                 message['data']['error_sub'] = 'Too busy'
+            elif raw[1] == 3:
+                message['data']['error_sub'] = 'User interrupt'
             else:
                 message['data']['error_sub'] = raw[1]
         else:
