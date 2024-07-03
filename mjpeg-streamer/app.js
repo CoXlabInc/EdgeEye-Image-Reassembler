@@ -40,7 +40,7 @@ try {
     process.exit(1);
 }
 
-async function sendAnImage(res, bufferKey, timestampKey, locale, timezone, height) {
+async function sendAnImage(res, bufferKey, timestampKey, locale, timezone, height, mjpeg) {
     if (res.writableEnded) {
         return;
     }
@@ -51,8 +51,11 @@ async function sendAnImage(res, bufferKey, timestampKey, locale, timezone, heigh
     
     if (buffer.length > 0) {
         let image;
-        
-        res.write('Content-Type: image/jpeg\r\n');
+       
+        if (mjpeg) {
+            res.write('Content-Type: image/jpeg\r\n');
+        }
+
         try {
             image = sharp(buffer, { failOn: 'none' });
         } catch(e) {
@@ -85,13 +88,18 @@ async function sendAnImage(res, bufferKey, timestampKey, locale, timezone, heigh
             left:0
         }]).jpeg().toBuffer();
         
-        res.write(`Content-Length: ${buffer.length}\r\n\r\n`);
-        res.write(buffer, 'binary');
-        console.log(`Load and write data ${buffer.length}`);
-        res.write('\r\n--' + boundaryID + '\r\n');
+        if(mjpeg) {
+            res.write(`Content-Length: ${buffer.length}\r\n\r\n`);
+            res.write(buffer, 'binary');
+            console.log(`Load and write data ${buffer.length}`);
+            res.write('\r\n--' + boundaryID + '\r\n');
+        } else {
+            res.end(buffer, 'binary');
+        }
     }
-
-    setTimeout(sendAnImage, 1000, res, bufferKey, timestampKey, locale, timezone, height);
+    if(mjpeg == true) {
+        setTimeout(sendAnImage, 1000, res, bufferKey, timestampKey, locale, timezone, height, mjpeg);
+    }
 };
 
 /**
@@ -142,16 +150,21 @@ var server = http.createServer(async (req, res) => {
             res.end();
             return;
         } else {
-            res.writeHead(200, {
-                'Content-Type': 'multipart/x-mixed-replace;boundary="' + boundaryID + '"',
-                'Connection': 'keep-alive',
-                'Expires': 'Fri, 27 May 1977 00:00:00 GMT',
-                'Cache-Control': 'no-cache, no-store, max-age=0, must-revalidate',
-                'Pragma': 'no-cache'
-            });
+            let mjpeg = params.get('mjpeg');
+            mjpeg = !(mjpeg == 'false');
+            if(mjpeg) {
+                res.writeHead(200, {
+                    'Content-Type': 'multipart/x-mixed-replace;boundary="' + boundaryID + '"',
+                    'Connection': 'keep-alive',
+                    'Expires': 'Fri, 27 May 1977 00:00:00 GMT',
+                    'Cache-Control': 'no-cache, no-store, max-age=0, must-revalidate',
+                    'Pragma': 'no-cache'
+                });
+                res.write('--' + boundaryID + '\r\n');
+            } else {
+                res.writeHead(200, {'Content-Type': 'image/jpeg'});
+            }
             console.log('writing header');
-
-            res.write('--' + boundaryID + '\r\n');
 
             let locale = params.get('locale');
             if (locale == null) {
@@ -165,8 +178,7 @@ var server = http.createServer(async (req, res) => {
             if (isNaN(height)) {
                 height = 30;
             }
-            
-            await sendAnImage(res, bufferKey, timestampKey, locale, timezone, height);
+            await sendAnImage(res, bufferKey, timestampKey, locale, timezone, height, mjpeg);
         }
 
         res.on('close', function() {
