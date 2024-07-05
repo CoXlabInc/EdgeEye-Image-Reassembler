@@ -110,6 +110,9 @@ def post_process(message, param=None):
     epoch = int.from_bytes(raw[1:6], 'little', signed=False)
     offset = int.from_bytes(raw[6:9], 'little', signed=False)
 
+    total_size_key = f"PP:EdgeEye:size:{message['nid']}:{epoch}"
+    missing_blocks_key = f"PP:EdgeEye:missing:{message['nid']}:{epoch}"
+
     i = 9
     
     if (flags & (1 << 2)) == 0:
@@ -170,7 +173,6 @@ def post_process(message, param=None):
         offset = 0
     elif total_size is None:
         # to keep backward compatible
-        total_size_key = f"PP:EdgeEye:size:{message['nid']}:{epoch}"
         total_size = r.get(total_size_key)
         if total_size is not None:
             total_size = int(total_size)
@@ -179,21 +181,79 @@ def post_process(message, param=None):
             offset_next = 0
             total_size = 0
 
+    missing_blocks = r.get(missing_blocks_key)
+    try:
+        missing_blocks = json.loads(missing_blocks)
+    except:
+        missing_blocks = []
+
+    offset_end = offset + len(frag)
+
+    print(f"[{TAG}] nid:{message['nid']}, current:{offset}~{offset_end}, max pos:{offset_next}")
     if offset > offset_next:
+        print(f"[{TAG}] nid:{message['nid']}, {offset_next} expected but {offset}. add a missing block")
+        if (offset_next, offset) not in missing_blocks:
+            missing_blocks.append((offset_next, offset))
+            r.set(missing_blocks_key, json.dumps(missing_blocks), timedelta(hours=24))
+        else:
+            r.expire(missing_blocks_key, timedelta(hours=24))
+    elif offset < offset_next:
+        # remove missing blocks
+        updated_missing_blocks = []
+        for b in missing_blocks:
+            print(f"[{TAG}] nid:{message['nid']}, missing: {b[0]}~{b[1]}, current: {offset}~{offset_end} => ", end="")
+            if offset <= b[0] and offset_end >= b[1]:
+                # The current includes the missing block
+                print("Found!")
+                continue
+            elif offset <= b[0] and b[0] < offset_end and offset_end < b[1]:
+                # shrinks head
+                print("shrinks head")
+                b[0] = offset_end
+                updated_missing_blocks.append(b)
+            elif b[0] < offset and offset < b[1] and b[1] <= offset_end:
+                # shrinks tail
+                print("shirnks tail")
+                b[1] = offset
+                updated_missing_blocks.append(b)
+            elif offset > b[0] and offset_end < b[1]:
+                # splits
+                print("split")
+                c = [offset_end, b[1]]
+                updated_missing_blocks.append(c)
+                b[1] = offset
+                updated_missing_blocks.append(b)
+            else:
+                print("out of range")
+                # out of range
+                updated_missing_blocks.append(b)
+        missing_blocks = updated_missing_blocks
+        if len(missing_blocks) > 0:
+            r.set(missing_blocks_key, json.dumps(missing_blocks), timedelta(hours=24))
+        else:
+            r.delete(missing_blocks_key)
+
+    reassembled_offset = offset_next + len(frag)
+
+    if len(missing_blocks) > 0:
         result = pyiotown.get.command(iotown_url, iotown_token, message['nid'],
                                       group_id=message['grpid'], verify=False)
         command_status = result.get('command')
-        print(f"[{TAG}] There was packet loss. (nid:{message['nid']}, fcnt:{fcnt}, offset {offset_next} is expected but {offset})")
-        if command_status is not None and len(command_status) == 0:            
-            frag_req = raw[1:6] + (offset_next).to_bytes(3, byteorder='little', signed=False)
+        print(f"[{TAG}] There was packet loss. (nid:{message['nid']}, fcnt:{fcnt}, missing:{missing_blocks[0][0]}~{missing_blocks[0][1]})")
+        if command_status is not None and len(command_status) == 0:
+            frag_req = (raw[1:6]
+                        + (missing_blocks[0][0]).to_bytes(3, byteorder='little', signed=False)
+                        + (missing_blocks[0][1]).to_bytes(3, byteorder='little', signed=False))
             pyiotown.post.command(iotown_url, iotown_token,
                                   message['nid'],
                                   frag_req,
                                   lorawan={ 'f_port': 4 },    # fragment request
                                   group_id=message['grpid'],
                                   verify=False)
-        r.delete(mutex_key)
-        return None
+
+        for b in missing_blocks:
+            if b[0] < reassembled_offset:
+                reassembled_offset = b[0]
 
     l = message['meta']
     del l['raw']
@@ -209,9 +269,10 @@ def post_process(message, param=None):
 
     last_frag = ((flags & (1 << 1)) != 0)
     if last_frag:
-        image = r.get(image_buffer_key)
-        if image is not None:
-            image += frag
+        if first_frag == False:
+            r.setrange(image_buffer_key, offset, frag)
+
+            image = r.get(image_buffer_key)[:reassembled_offset]
 
             try:
                 image = Image.open(io.BytesIO(image))
@@ -237,13 +298,13 @@ def post_process(message, param=None):
                 r.expire(rtsp_buffer_key, timedelta(hours=24))
                 r.set(rtsp_timestamp_key, sense_time, timedelta(hours=24))
             
+            r.delete(missing_blocks_key)
             r.delete(image_buffer_key)
             print(f"[{TAG}] image reassembly completed (nid:{message['nid']}, fcnt:{fcnt}, size:{len(jpeg_completed)})")
     else:
         r.setrange(image_buffer_key, offset, frag)
-        offset += len(frag)
 
-        jpeg_raw = r.get(image_buffer_key)
+        jpeg_raw = r.get(image_buffer_key)[:reassembled_offset]
 
         try:
             image = Image.open(io.BytesIO(jpeg_raw))
@@ -273,11 +334,12 @@ def post_process(message, param=None):
                 'file_size': len(jpeg_raw),
             }
 
-        message['data']['received'] = offset
+        message['data']['received'] = offset_end if offset_end > offset_next else offset_next
+        message['data']['reassembled'] = reassembled_offset
         message['data']['total_size'] = total_size
 
         r.expire(image_buffer_key, timedelta(hours=1))
-        print(f"[{TAG}] image reassembly in progress (nid:{message['nid']}, fcnt:{fcnt}, +{len(frag)} bytes, {offset}/{total_size} ({(offset / total_size * 100) if total_size > 0 else 0:.2f}%))")
+        print(f"[{TAG}] image reassembly in progress (nid:{message['nid']}, fcnt:{fcnt}, +{len(frag)} bytes, {reassembled_offset}/{total_size} ({(reassembled_offset / total_size * 100) if total_size > 0 else 0:.2f}%))")
 
     r.delete(mutex_key)
     
