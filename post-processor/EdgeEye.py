@@ -247,9 +247,11 @@ def post_process(message, param=None):
             pyiotown.post.command(iotown_url, iotown_token,
                                   message['nid'],
                                   frag_req,
-                                  lorawan={ 'f_port': 4 },    # fragment request
+                                  lorawan={ 'f_port': 4, 'confirmed': False },    # fragment request
                                   group_id=message['grpid'],
                                   verify=False)
+        else:
+            print(command_status)
 
         for b in missing_blocks:
             if b[0] < reassembled_offset:
@@ -280,6 +282,7 @@ def post_process(message, param=None):
                 print(f"[{TAG}] open image error '{e}'", file=sys.stderr)
                 image = None
 
+            jpeg_completed = bytearray()
             if image is not None:
                 #Last reassembled
                 f = io.BytesIO()
@@ -291,16 +294,18 @@ def post_process(message, param=None):
                     'file_ext': 'jpeg',
                     'file_size': len(jpeg_completed),
                 }
-        
+
+            r.set(rtsp_buffer_key, jpeg_completed, timedelta(hours=24))
+            r.set(rtsp_timestamp_key, sense_time, timedelta(hours=24))
+
+            if len(missing_blocks) == 0:
                 r.set(rtsp_last_buffer_key, jpeg_completed, timedelta(hours=24))
                 r.set(rtsp_last_timestamp_key, sense_time, timedelta(hours=24))
                 r.copy(rtsp_last_buffer_key, rtsp_buffer_key, replace=True)
-                r.expire(rtsp_buffer_key, timedelta(hours=24))
-                r.set(rtsp_timestamp_key, sense_time, timedelta(hours=24))
-            
-            r.delete(missing_blocks_key)
-            r.delete(image_buffer_key)
-            print(f"[{TAG}] image reassembly completed (nid:{message['nid']}, fcnt:{fcnt}, size:{len(jpeg_completed)})")
+
+                r.delete(missing_blocks_key)
+                r.delete(image_buffer_key)
+                print(f"[{TAG}] image reassembly completed (nid:{message['nid']}, fcnt:{fcnt}, size:{len(jpeg_completed)})")
     else:
         r.setrange(image_buffer_key, offset, frag)
 
