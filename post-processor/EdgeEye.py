@@ -282,7 +282,7 @@ def post_process(message, param=None):
                 print(f"[{TAG}] open image error '{e}'", file=sys.stderr)
                 image = None
 
-            jpeg_completed = bytearray()
+            jpeg_completed = bytes()
             if image is not None:
                 #Last reassembled
                 f = io.BytesIO()
