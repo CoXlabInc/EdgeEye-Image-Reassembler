@@ -189,7 +189,7 @@ def post_process(message, param=None):
 
     offset_end = offset + len(frag)
 
-    print(f"[{TAG}] nid:{message['nid']}, current:{offset}~{offset_end}, max pos:{offset_next}")
+    print(f"[{TAG}] nid:{message['nid']}, current(first:{first_frag}):{offset}~{offset_end}, max pos:{offset_next}, total size:{total_size}")
     if offset > offset_next:
         print(f"[{TAG}] nid:{message['nid']}, {offset_next} expected but {offset}. add a missing block")
         if (offset_next, offset) not in missing_blocks:
@@ -236,22 +236,34 @@ def post_process(message, param=None):
     reassembled_offset = offset_next + len(frag)
 
     if len(missing_blocks) > 0:
-        result = pyiotown.get.command(iotown_url, iotown_token, message['nid'],
+        success, result = pyiotown.get.command(iotown_url, iotown_token, message['nid'],
                                       group_id=message['grpid'], verify=False)
-        command_status = result.get('command')
-        print(f"[{TAG}] There was packet loss. (nid:{message['nid']}, fcnt:{fcnt}, missing:{missing_blocks[0][0]}~{missing_blocks[0][1]})")
-        if command_status is not None and len(command_status) == 0:
-            frag_req = (raw[1:6]
-                        + (missing_blocks[0][0]).to_bytes(3, byteorder='little', signed=False)
-                        + (missing_blocks[0][1]).to_bytes(3, byteorder='little', signed=False))
-            pyiotown.post.command(iotown_url, iotown_token,
-                                  message['nid'],
-                                  frag_req,
-                                  lorawan={ 'f_port': 4, 'confirmed': False },    # fragment request
-                                  group_id=message['grpid'],
-                                  verify=False)
-        else:
-            print(command_status)
+        if success == True:
+            command_status = result.get('command')
+
+            missing_min = 0
+            for b in range(len(missing_blocks)):
+                if missing_blocks[b][0] < missing_blocks[missing_min][0]:
+                    missing_min = b
+
+            missing_min = missing_blocks[missing_min]
+            
+            print(f"[{TAG}] There was packet loss. (nid:{message['nid']}, fcnt:{fcnt}, missing:{missing_min[0]}~{missing_min[1]}, total:{total_size})")
+            if command_status is not None and len(command_status) == 0:
+                frag_req = raw[1:6]
+                # if total_size == 0:
+                #     frag_req += b'\x00\x00\x00'
+                # else:
+                frag_req += ((missing_min[0]).to_bytes(3, byteorder='little', signed=False) +
+                             (missing_min[1]).to_bytes(3, byteorder='little', signed=False))
+                pyiotown.post.command(iotown_url, iotown_token,
+                                      message['nid'],
+                                      frag_req,
+                                      lorawan={ 'f_port': 4, 'confirmed': False },    # fragment request
+                                      group_id=message['grpid'],
+                                      verify=False)
+            else:
+                print(command_status)
 
         for b in missing_blocks:
             if b[0] < reassembled_offset:
