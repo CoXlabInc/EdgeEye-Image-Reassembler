@@ -5,15 +5,17 @@ import pyiotown.post_process
 import pyiotown.get
 import pyiotown.delete
 import pyiotown.post
-import redis
+import redis.asyncio as redis
 from urllib.parse import urlparse
 import io
 from PIL import ImageFile
-ImageFile.LOAD_TRUNCATED_IMAGES = True
 from PIL import Image, ImageDraw
 import sys
+import asyncio
+import threading
 
 TAG = 'EdgeEye'
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 def init(url, pp_name, mqtt_url, redis_url, dry_run=False):
     global iotown_url, iotown_token
@@ -26,34 +28,24 @@ def init(url, pp_name, mqtt_url, redis_url, dry_run=False):
         print(f"Redis is required for EdgeEye.")
         return None
 
+    pool = redis.ConnectionPool.from_url(redis_url)
     global r
-    
-    try:
-        r = redis.from_url(redis_url)
-        if r.ping() == False:
-            r = None
-            raise Exception('Redis connection failed')
-    except Exception as e:
-        print(redis_url)
-        raise(e)
+    r = redis.Redis.from_pool(pool)
+
+    global event_loop
+    event_loop = asyncio.new_event_loop()
+
+    def event_loop_thread():
+        event_loop.run_forever()
+    threading.Thread(target=event_loop_thread, daemon=True).start()
     
     return pyiotown.post_process.connect_common(url, pp_name, post_process, mqtt_url, dry_run=dry_run)
-    
-def post_process(message, param=None):
-    fport = [1, 2, 3]
 
-    if message['meta'].get('fPort') not in fport:
-        return message
-    
-    raw = message['meta'].get('raw')
-    
-    if raw is None:
-        return message
-
+async def async_post_process(message):
     #MUTEX
     mutex_key = f"PP:EdgeEye:MUTEX:{message['grpid']}:{message['nid']}:{message['key']}"
-    lock = r.set(mutex_key, 'lock', ex=30, nx=True)
-    print(f"[{TAG}] lock with '{mutex_key}': {lock}")
+    lock = await r.set(mutex_key, 'lock', ex=30, nx=True)
+    print(f"[{TAG}:{message['nid']}] lock with '{mutex_key}': {lock}")
     if lock != True:
         return None
 
@@ -62,7 +54,7 @@ def post_process(message, param=None):
     message['data']['meta_total'] = []
     
     fport = message['meta'].get('fPort')
-    raw = base64.b64decode(raw)
+    raw = base64.b64decode(message['meta']['raw'])
 
     if fport == 2:
         # Fail Report
@@ -134,33 +126,33 @@ def post_process(message, param=None):
     message['data']['system_voltage'] = sysv
     message['data']['ambient_light_lux'] = als
 
-    result = pyiotown.get.storage(iotown_url, iotown_token,
-                                  message['nid'],
-                                  group_id=message['grpid'],
-                                  count=10,
-                                  verify=False)
+    success, result = await pyiotown.get.async_storage(iotown_url, iotown_token,
+                                                       message['nid'],
+                                                       group_id=message['grpid'],
+                                                       count=10,
+                                                       verify=False)
     prev_data = None
-    for i in range(len(result['data'])):
-        if result['data'][i]['value'].get('fPort') == fport and result['data'][i]['value'].get('sense_time') == sense_time:
-            prev_data = result['data'][i]['value']
-            prev_data_id = result['data'][i]['_id']
-            #print(f"[{TAG}] prev: {result}")
-            
-            offset_next = prev_data.get('received')
-            if offset_next is None:
-                offset_next = 0
+    if success == True:
+        for i in range(len(result['data'])):
+            if result['data'][i]['value'].get('fPort') == fport and result['data'][i]['value'].get('sense_time') == sense_time:
+                prev_data = result['data'][i]['value']
+                prev_data_id = result['data'][i]['_id']
                 
-            if message['data'].get('system_voltage') is None:
-                message['data']['system_voltage'] = prev_data.get('system_voltage')
-            if message['data'].get('ambient_light_lux') is None:
-                message['data']['ambient_light_lux'] = prev_data.get('ambient_light_lux')
+                offset_next = prev_data.get('received')
+                if offset_next is None:
+                    offset_next = 0
+                
+                if message['data'].get('system_voltage') is None:
+                    message['data']['system_voltage'] = prev_data.get('system_voltage')
+                if message['data'].get('ambient_light_lux') is None:
+                    message['data']['ambient_light_lux'] = prev_data.get('ambient_light_lux')
 
-            total_size = prev_data.get('total_size')
+                total_size = prev_data.get('total_size')
 
-            meta = prev_data.get('meta_total')
-            if meta is None:
-                meta = []
-            break
+                meta = prev_data.get('meta_total')
+                if meta is None:
+                    meta = []
+                break
 
     if prev_data is None:
         offset_next = 0
@@ -173,15 +165,15 @@ def post_process(message, param=None):
         offset = 0
     elif total_size is None:
         # to keep backward compatible
-        total_size = r.get(total_size_key)
+        total_size = await r.get(total_size_key)
         if total_size is not None:
             total_size = int(total_size)
         else:
-            print(f"[{TAG}] GET '{total_size_key}' returned None")
+            print(f"[{TAG}:{message['nid']}] GET '{total_size_key}' returned None")
             offset_next = 0
             total_size = 0
 
-    missing_blocks = r.get(missing_blocks_key)
+    missing_blocks = await r.get(missing_blocks_key)
     try:
         missing_blocks = json.loads(missing_blocks)
     except:
@@ -189,19 +181,19 @@ def post_process(message, param=None):
 
     offset_end = offset + len(frag)
 
-    print(f"[{TAG}] nid:{message['nid']}, current(first:{first_frag}):{offset}~{offset_end}, max pos:{offset_next}, total size:{total_size}")
+    print(f"[{TAG}:{message['nid']}:{sense_time}] current(first:{first_frag}):{offset}~{offset_end}, max pos:{offset_next}, total size:{total_size}")
     if offset > offset_next:
-        print(f"[{TAG}] nid:{message['nid']}, {offset_next} expected but {offset}. add a missing block")
+        print(f"[{TAG}:{message['nid']}:{sense_time}] {offset_next} expected but {offset}. add a missing block")
         if (offset_next, offset) not in missing_blocks:
             missing_blocks.append((offset_next, offset))
-            r.set(missing_blocks_key, json.dumps(missing_blocks), timedelta(hours=24))
+            await r.set(missing_blocks_key, json.dumps(missing_blocks), timedelta(hours=24))
         else:
-            r.expire(missing_blocks_key, timedelta(hours=24))
+            await r.expire(missing_blocks_key, timedelta(hours=24))
     elif offset < offset_next:
         # remove missing blocks
         updated_missing_blocks = []
         for b in missing_blocks:
-            print(f"[{TAG}] nid:{message['nid']}, missing: {b[0]}~{b[1]}, current: {offset}~{offset_end} => ", end="")
+            print(f"[{TAG}:{message['nid']}:{sense_time}] missing:{b[0]}~{b[1]}, current:{offset}~{offset_end} => ", end="")
             if offset <= b[0] and offset_end >= b[1]:
                 # The current includes the missing block
                 print("Found!")
@@ -229,15 +221,15 @@ def post_process(message, param=None):
                 updated_missing_blocks.append(b)
         missing_blocks = updated_missing_blocks
         if len(missing_blocks) > 0:
-            r.set(missing_blocks_key, json.dumps(missing_blocks), timedelta(hours=24))
+            await r.set(missing_blocks_key, json.dumps(missing_blocks), timedelta(hours=24))
         else:
-            r.delete(missing_blocks_key)
+            await r.delete(missing_blocks_key)
 
     reassembled_offset = offset_next + len(frag)
 
     if len(missing_blocks) > 0:
-        success, result = pyiotown.get.command(iotown_url, iotown_token, message['nid'],
-                                      group_id=message['grpid'], verify=False)
+        success, result = await pyiotown.get.async_command(iotown_url, iotown_token, message['nid'],
+                                                           group_id=message['grpid'], verify=False)
         if success == True:
             command_status = result.get('command')
 
@@ -248,7 +240,7 @@ def post_process(message, param=None):
 
             missing_min = missing_blocks[missing_min]
             
-            print(f"[{TAG}] There was packet loss. (nid:{message['nid']}, fcnt:{fcnt}, missing:{missing_min[0]}~{missing_min[1]}, total:{total_size})")
+            print(f"[{TAG}:{message['nid']}:{sense_time}] There was packet loss. (fcnt:{fcnt}, missing:{missing_min[0]}~{missing_min[1]}, total:{total_size})")
             if command_status is not None and len(command_status) == 0:
                 frag_req = raw[1:6]
                 # if total_size == 0:
@@ -256,14 +248,14 @@ def post_process(message, param=None):
                 # else:
                 frag_req += ((missing_min[0]).to_bytes(3, byteorder='little', signed=False) +
                              (missing_min[1]).to_bytes(3, byteorder='little', signed=False))
-                pyiotown.post.command(iotown_url, iotown_token,
-                                      message['nid'],
-                                      frag_req,
-                                      lorawan={ 'f_port': 4, 'confirmed': False },    # fragment request
-                                      group_id=message['grpid'],
-                                      verify=False)
-            else:
-                print(command_status)
+                await pyiotown.post.async_command(iotown_url, iotown_token,
+                                                  message['nid'],
+                                                  frag_req,
+                                                  lorawan={ 'f_port': 4, 'confirmed': False },    # fragment request
+                                                  group_id=message['grpid'],
+                                                  verify=False)
+            # else:
+            #     print(command_status)
 
         for b in missing_blocks:
             if b[0] < reassembled_offset:
@@ -284,14 +276,14 @@ def post_process(message, param=None):
     last_frag = ((flags & (1 << 1)) != 0)
     if last_frag:
         if first_frag == False:
-            r.setrange(image_buffer_key, offset, frag)
+            await r.setrange(image_buffer_key, offset, frag)
 
-            image = r.get(image_buffer_key)[:reassembled_offset]
+            image = (await r.get(image_buffer_key))[:reassembled_offset]
 
             try:
                 image = Image.open(io.BytesIO(image))
             except Exception as e:
-                print(f"[{TAG}] open image error '{e}'", file=sys.stderr)
+                print(f"[{TAG}:{message['nid']}:{sense_time}] open image error '{e}'", file=sys.stderr)
                 image = None
 
             jpeg_completed = bytes()
@@ -307,21 +299,21 @@ def post_process(message, param=None):
                     'file_size': len(jpeg_completed),
                 }
 
-            r.set(rtsp_buffer_key, jpeg_completed, timedelta(hours=24))
-            r.set(rtsp_timestamp_key, sense_time, timedelta(hours=24))
+            await r.set(rtsp_buffer_key, jpeg_completed, timedelta(hours=24))
+            await r.set(rtsp_timestamp_key, sense_time, timedelta(hours=24))
 
             if len(missing_blocks) == 0:
-                r.set(rtsp_last_buffer_key, jpeg_completed, timedelta(hours=24))
-                r.set(rtsp_last_timestamp_key, sense_time, timedelta(hours=24))
-                r.copy(rtsp_last_buffer_key, rtsp_buffer_key, replace=True)
+                await r.set(rtsp_last_buffer_key, jpeg_completed, timedelta(hours=24))
+                await r.set(rtsp_last_timestamp_key, sense_time, timedelta(hours=24))
+                await r.copy(rtsp_last_buffer_key, rtsp_buffer_key, replace=True)
 
-                r.delete(missing_blocks_key)
-                r.delete(image_buffer_key)
-                print(f"[{TAG}] image reassembly completed (nid:{message['nid']}, fcnt:{fcnt}, size:{len(jpeg_completed)})")
+                await r.delete(missing_blocks_key)
+                await r.delete(image_buffer_key)
+                print(f"[{TAG}:{message['nid']}:{sense_time}] image reassembly completed (fcnt:{fcnt}, size:{len(jpeg_completed)})")
     else:
-        r.setrange(image_buffer_key, offset, frag)
+        await r.setrange(image_buffer_key, offset, frag)
 
-        jpeg_raw = r.get(image_buffer_key)[:reassembled_offset]
+        jpeg_raw = (await r.get(image_buffer_key))[:reassembled_offset]
 
         try:
             image = Image.open(io.BytesIO(jpeg_raw))
@@ -341,8 +333,8 @@ def post_process(message, param=None):
                 'file_size': len(jpeg_reassembled),
             }
             
-            r.set(rtsp_buffer_key, jpeg_reassembled, timedelta(hours=24))
-            r.set(rtsp_timestamp_key, sense_time, timedelta(hours=24))
+            await r.set(rtsp_buffer_key, jpeg_reassembled, timedelta(hours=24))
+            await r.set(rtsp_timestamp_key, sense_time, timedelta(hours=24))
         else:
             message['data']['image'] = {
                 'raw': jpeg_raw,
@@ -355,13 +347,26 @@ def post_process(message, param=None):
         message['data']['reassembled'] = reassembled_offset
         message['data']['total_size'] = total_size
 
-        r.expire(image_buffer_key, timedelta(hours=1))
-        print(f"[{TAG}] image reassembly in progress (nid:{message['nid']}, fcnt:{fcnt}, +{len(frag)} bytes, {reassembled_offset}/{total_size} ({(reassembled_offset / total_size * 100) if total_size > 0 else 0:.2f}%))")
+        await r.expire(image_buffer_key, timedelta(hours=1))
+        print(f"[{TAG}:{message['nid']}:{sense_time}] image reassembly in progress (fcnt:{fcnt}, +{len(frag)} bytes, {reassembled_offset}/{total_size} ({(reassembled_offset / total_size * 100) if total_size > 0 else 0:.2f}%))")
 
-    r.delete(mutex_key)
+    await r.delete(mutex_key)
     
     if prev_data is not None:
         result = pyiotown.delete.data(iotown_url, iotown_token, _id=prev_data_id, group_id=message['grpid'], verify=False)
         #print(f"[{TAG}] delete prev data _id:${prev_data_id}: {result}")
         
     return message
+    
+def post_process(message, param=None):
+    fport = [1, 2, 3]
+
+    if message['meta'].get('fPort') not in fport:
+        return message
+    
+    raw = message['meta'].get('raw')
+    
+    if raw is None:
+        return message
+
+    return asyncio.run_coroutine_threadsafe(async_post_process(message), event_loop)
