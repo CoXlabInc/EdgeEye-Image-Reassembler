@@ -17,7 +17,7 @@ import threading
 TAG = 'EdgeEye'
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-def init(url, pp_name, mqtt_url, redis_url, dry_run=False):
+def init(url, pp_name, mqtt_url, redis_url, chirpstack_url=None, dry_run=False):
     global iotown_url, iotown_token
     
     url_parsed = urlparse(url)
@@ -27,6 +27,9 @@ def init(url, pp_name, mqtt_url, redis_url, dry_run=False):
     if redis_url is None:
         print(f"Redis is required for EdgeEye.")
         return None
+
+    if chirpstack_url is not None:
+        print(f"Chirpstack is used: {chirpstack_url}")
 
     global pool
     pool = redis.ConnectionPool.from_url(redis_url)

@@ -20,6 +20,7 @@ if __name__ == '__main__':
     parser.add_argument("--url", help="IoT.own URL", required=True)
     parser.add_argument("--mqtt_url", help="MQTT broker URL for IoT.own", required=False, default=None)
     parser.add_argument("--redis_url", help="Redis URL for context storage", required=False, default=None)
+    parser.add_argument("--chirpstack_url", help="Chirpstack Application Server URL for performance enhancement", required=False, default=None)
     parser.add_argument('--dry', help=" Do not upload data to the server", type=int, default=0)
     args = parser.parse_args()
 
@@ -30,10 +31,11 @@ if __name__ == '__main__':
     print(f"URL: {url_parsed.scheme}://{url_parsed.hostname}" + (f":{url_parsed.port}" if url_parsed.port is not None else ""))
 
     mqtt_url = args.mqtt_url.strip() if args.mqtt_url is not None else None
-        
+    chirpstack_url = args.chirpstack_url.strip() if args.chirpstack_url is not None else None
+    
     if args.dry == 1:
         dry_run = True
         print("DRY RUNNING!")
 
     print(f"Redis: {args.redis_url}")
-    EdgeEye.init(url, 'EdgeEye', mqtt_url, args.redis_url.strip(), dry_run=dry_run).loop_forever()
+    EdgeEye.init(url, 'EdgeEye', mqtt_url, args.redis_url.strip(), chirpstack_url=chirpstack_url, dry_run=dry_run).loop_forever()

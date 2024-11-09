@@ -49,6 +49,8 @@ services:
       - tcp://mosquitto:8883
       - --redis_url
       - ${REDIS_URL:-redis://redis}
+      - --chirpstack_url
+      - ${CHIRPSTACK_URL:-}
       - --dry
       - $IOTOWN_MESSAGE_PARSER_DRY_RUN
 
