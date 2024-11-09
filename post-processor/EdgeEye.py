@@ -38,7 +38,7 @@ def init(url, pp_name, mqtt_url, redis_url, dry_run=False):
         event_loop.run_forever()
     threading.Thread(target=event_loop_thread, daemon=True).start()
     
-    return pyiotown.post_process.connect_common(url, pp_name, post_process, mqtt_rul=mqtt_url, dry_run=dry_run)
+    return pyiotown.post_process.connect_common(url, pp_name, post_process, mqtt_url=mqtt_url, dry_run=dry_run)
 
 async def async_post_process(message):
     r = redis.Redis(connection_pool=pool)
