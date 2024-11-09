@@ -266,6 +266,17 @@ async def async_post_process(message):
     meta.append(l)
 
     message['data']['meta_total'] = meta
+
+    if len(meta) > 1:
+        fcnts = list(range(meta[0]['fCnt'], meta[-1]['fCnt'] + 1))
+        fcnts_missing = fcnts.copy()
+        for m in meta:
+            fcnts_missing.remove(m['fCnt'])
+        message['data']['prr'] = (len(fcnts) - len(fcnts_missing)) / len(fcnts) * 100
+
+    start_time = datetime.strptime(sense_time, '%Y-%m-%dT%H:%M:%SZ')
+    end_time = datetime.now()
+    message['data']['sec_taken'] = end_time.timestamp() - start_time.timestamp()
     
     image_buffer_key = f"PP:EdgeEye:buffer:{message['nid']}:{epoch}"
     rtsp_buffer_key = f"ImageToRtsp:{message['nid']}:image"
