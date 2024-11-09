@@ -51,6 +51,8 @@ services:
       - ${REDIS_URL:-redis://redis}
       - --chirpstack_url
       - ${CHIRPSTACK_URL:-}
+      - --chirpstack_jwt_secret
+      - ${CHIRPSTACK_JWT_SECRET:-}
       - --dry
       - $IOTOWN_MESSAGE_PARSER_DRY_RUN
 

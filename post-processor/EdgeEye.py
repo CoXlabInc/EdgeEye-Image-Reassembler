@@ -1,5 +1,6 @@
 import base64
 from datetime import datetime, timedelta
+import time
 import json
 import pyiotown.post_process
 import pyiotown.get
@@ -12,12 +13,14 @@ from PIL import ImageFile
 from PIL import Image, ImageDraw
 import sys
 import asyncio
+import aiohttp
 import threading
+import jwt
 
 TAG = 'EdgeEye'
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-def init(url, pp_name, mqtt_url, redis_url, chirpstack_url=None, dry_run=False):
+def init(url, pp_name, mqtt_url, redis_url, chirpstack=None, dry_run=False):
     global iotown_url, iotown_token
     
     url_parsed = urlparse(url)
@@ -27,9 +30,6 @@ def init(url, pp_name, mqtt_url, redis_url, chirpstack_url=None, dry_run=False):
     if redis_url is None:
         print(f"Redis is required for EdgeEye.")
         return None
-
-    if chirpstack_url is not None:
-        print(f"Chirpstack is used: {chirpstack_url}")
 
     global pool
     pool = redis.ConnectionPool.from_url(redis_url)
@@ -41,7 +41,59 @@ def init(url, pp_name, mqtt_url, redis_url, chirpstack_url=None, dry_run=False):
         event_loop.run_forever()
     threading.Thread(target=event_loop_thread, daemon=True).start()
     
+    global chirp
+    chirp = None
+    if chirpstack is not None:
+        url_parsed = urlparse(chirpstack.get('url'))
+
+        chirp = {
+            'url': f"{url_parsed.scheme}://{url_parsed.hostname}" + (f":{url_parsed.port}" if url_parsed.port is not None else ""),
+            'secret': base64.b64decode(chirpstack.get('secret')),
+            'username': url_parsed.username,
+            'password': url_parsed.password
+        }
+        #print(f"Chirpstack is used: {chirp}")
+        def logged_in(future):
+            token = future.result()
+            if token is not None:
+                print("Login to chirpstack success")
+            else:
+                print("Login to chirpstack failed")
+        
+        asyncio.run_coroutine_threadsafe(chirpstack_login(), event_loop).add_done_callback(logged_in)
+
     return pyiotown.post_process.connect_common(url, pp_name, post_process, mqtt_url=mqtt_url, dry_run=dry_run)
+
+async def chirpstack_login():
+    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=True, verify_ssl=False)) as session:
+        async with session.post(chirp['url'] + '/api/internal/login',
+                                headers = {
+                                    'Content-Type': 'application/json',
+                                    'Accept': 'application/json',
+                                    'Grpc-Metadata-Authorization': jwt.encode({
+                                        'iss': 'chirpstack-application-server',
+                                        'aud': 'chirpstack-application-server',
+                                        'nbf': int(time.time()),
+                                        'exp': int(time.time()) + 60,
+                                        'sub': 'EdgeEye-PP',
+                                        'username': chirp['username'],
+                                    }, chirp['secret'], algorithm='HS256')
+                                },
+                                json = {
+                                    'email': chirp['username'],
+                                    'password': chirp['password']
+                                }) as response:
+            content = await response.text()
+
+            try:
+                content = json.loads(content)
+            except:
+                pass
+            
+            if response.status == 200:
+                return content['jwt']
+            else:
+                return None
 
 async def async_post_process(message):
     r = redis.Redis(connection_pool=pool)
