@@ -28,9 +28,8 @@ def init(url, pp_name, mqtt_url, redis_url, dry_run=False):
         print(f"Redis is required for EdgeEye.")
         return None
 
+    global pool
     pool = redis.ConnectionPool.from_url(redis_url)
-    global r
-    r = redis.Redis.from_pool(pool)
 
     global event_loop
     event_loop = asyncio.new_event_loop()
@@ -39,14 +38,17 @@ def init(url, pp_name, mqtt_url, redis_url, dry_run=False):
         event_loop.run_forever()
     threading.Thread(target=event_loop_thread, daemon=True).start()
     
-    return pyiotown.post_process.connect_common(url, pp_name, post_process, mqtt_url, dry_run=dry_run)
+    return pyiotown.post_process.connect_common(url, pp_name, post_process, mqtt_rul=mqtt_url, dry_run=dry_run)
 
 async def async_post_process(message):
+    r = redis.Redis(connection_pool=pool)
+    
     #MUTEX
     mutex_key = f"PP:EdgeEye:MUTEX:{message['grpid']}:{message['nid']}:{message['key']}"
     lock = await r.set(mutex_key, 'lock', ex=30, nx=True)
     print(f"[{TAG}:{message['nid']}] lock with '{mutex_key}': {lock}")
     if lock != True:
+        await r.aclose()
         return None
 
     message['data']['image'] = None
@@ -90,9 +92,11 @@ async def async_post_process(message):
                 message['data']['error_sub'] = raw[1]
         else:
             message['data']['error'] = f"Unknown fail ({raw[0]})"
+        await r.aclose()
         return message
     elif fport != 1:
         message['data']['error'] = f"Not supported FPort ({fport})"
+        await r.aclose()
         return message
     
     #TODO length check
@@ -367,6 +371,7 @@ async def async_post_process(message):
         result = pyiotown.delete.data(iotown_url, iotown_token, _id=prev_data_id, group_id=message['grpid'], verify=False)
         #print(f"[{TAG}] delete prev data _id:${prev_data_id}: {result}")
         
+    await r.aclose()
     return message
     
 def post_process(message, param=None):
