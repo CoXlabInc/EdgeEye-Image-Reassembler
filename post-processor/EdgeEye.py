@@ -16,6 +16,7 @@ import asyncio
 import aiohttp
 import threading
 import jwt
+import secrets
 
 TAG = 'EdgeEye'
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -95,6 +96,126 @@ async def chirpstack_login():
             else:
                 return None
 
+async def create_new_session():
+    token = await chirpstack_login()
+    dev_eui = '70b3d5df1fff' + secrets.token_hex(2)
+    payload = {
+        "device": {
+            "applicationID": "8", #TODO how to get automatically ?
+            "description": dev_eui,
+            "devEUI": dev_eui,
+            "deviceProfileID": "465ec6b0-11ab-486b-b6d7-5db69f504c02", #TODO how to get automatically?
+            "isDisabled": False,
+            "name": dev_eui,
+            "referenceAltitude": 0,
+            "skipFCntCheck": False,
+            "tags": {},
+            "variables": {}
+        }
+    }
+    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=True, verify_ssl=False)) as session:
+        async with session.post(chirp['url'] + '/api/devices',
+                                headers={
+                                    'Content-Type': 'application/json',
+                                    'Accept': 'application/json',
+                                    'Grpc-Metadata-Authorization': 'Bearer ' + token
+                                },
+                                json=payload) as response:
+            content = await response.text()
+
+            try:
+                content = json.loads(content)
+            except:
+                pass
+            
+            if response.status != 200:
+                print(content)
+                return None
+
+        nwkSKey = secrets.token_hex(16)
+        device_activation = {
+            "aFCntDown": 0,
+            "appSKey": secrets.token_hex(16),
+            "devAddr": secrets.token_hex(4),
+            "devEUI": dev_eui,
+            "fCntUp": 0,
+            "fNwkSIntKey": nwkSKey,
+            "nFCntDown": 0,
+            "nwkSEncKey": nwkSKey,
+            "sNwkSIntKey": nwkSKey
+        }
+        async with session.post(chirp['url'] + f"/api/devices/{dev_eui}/activate",
+                                headers={
+                                    'Content-Type': 'application/json',
+                                    'Accept': 'application/json',
+                                    'Grpc-Metadata-Authorization': 'Bearer ' + token
+                                },
+                                json={
+                                    "deviceActivation": device_activation
+                                }) as response:
+            content = await response.text()
+
+            try:
+                content = json.loads(content)
+            except:
+                pass
+            
+            if response.status == 200:
+                session = {
+                    'dev_eui': dev_eui,
+                    'dev_addr': device_activation['devAddr'],
+                    'appskey': device_activation['appSKey'],
+                    'nwkskey': nwkSKey
+                }
+                return session
+            else:
+                print(content)
+
+        async with session.delete(chirp['url'] + f"/api/devices/{dev_eui}",
+                                headers={
+                                    'Accept': 'application/json',
+                                    'Grpc-Metadata-Authorization': 'Bearer ' + token
+                                }) as response:
+            content = await response.text()
+
+            try:
+                content = json.loads(content)
+            except:
+                pass
+            
+            if response.status != 200:
+                print(content)
+            
+    return None
+
+async def get_existing_session(dev_eui):
+    token = await chirpstack_login()
+    print(f"dev_eui:{dev_eui}")
+    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=True, verify_ssl=False)) as session:
+        async with session.get(chirp['url'] + f'/api/devices/{dev_eui}/activation',
+                               headers={
+                                   'Accept': 'application/json',
+                                   'Grpc-Metadata-Authorization': 'Bearer ' + token
+                               }) as response:
+            content = await response.text()
+
+            try:
+                content = json.loads(content)
+            except:
+                pass
+            
+            if response.status == 200:
+                session = {
+                    'dev_eui': content['deviceActivation']['devEUI'],
+                    'dev_addr': content['deviceActivation']['devAddr'],
+                    'appskey': content['deviceActivation']['appSKey'],
+                    'nwkskey': content['deviceActivation']['fNwkSIntKey']
+                }
+                return session
+            else:
+                print(content)
+                return None
+    
 async def async_post_process(message):
     r = redis.Redis(connection_pool=pool)
     
@@ -147,10 +268,12 @@ async def async_post_process(message):
                 message['data']['error_sub'] = raw[1]
         else:
             message['data']['error'] = f"Unknown fail ({raw[0]})"
+        await r.delete(mutex_key)
         await r.aclose()
         return message
     elif fport != 1:
         message['data']['error'] = f"Not supported FPort ({fport})"
+        await r.delete(mutex_key)
         await r.aclose()
         return message
     
@@ -219,6 +342,8 @@ async def async_post_process(message):
         meta = []
 
     first_frag = ((flags & (1 << 0)) != 0)
+    last_frag = ((flags & (1 << 1)) != 0)
+
     if first_frag:
         total_size = offset
         offset = 0
@@ -232,6 +357,51 @@ async def async_post_process(message):
             offset_next = 0
             total_size = 0
 
+    if not first_frag or not last_frag:
+        sessions_key = f"PP:EdgeEye:sessions:{message['nid']}:{epoch}"
+        sessions = await r.smembers(sessions_key)
+        print(f"[{TAG}:{message['nid']}:{sense_time}] assigned sessions: {sessions}")
+        if len(sessions) == 0:
+            session = await create_new_session()
+            if session is not None:
+                await r.sadd(sessions_key, session['dev_eui'])
+
+                session_usage_key = f"PP:EdgeEye:sessions:{message['nid']}:{epoch}:session:{session['dev_eui']}"
+                await r.set(session_usage_key, 0, ex=10)
+                
+                #Send the additional session to the device.
+                dev_addr = bytearray.fromhex(session['dev_addr'])
+                dev_addr.reverse()
+                nwkskey = bytes.fromhex(session['nwkskey'])
+                appskey = bytes.fromhex(session['appskey'])
+                await pyiotown.post.async_command(iotown_url, iotown_token,
+                                                  message['nid'],
+                                                  raw[1:6] + dev_addr + nwkskey + appskey,
+                                                  lorawan={ 'f_port': 5, 'confirmed': False },
+                                                  group_id=message['grpid'],
+                                                  verify=False)
+            else:
+                print(f"[{TAG}:{message['nid']}:{sense_time}] creating session failed")
+        else:
+            dev_eui = str(sessions.pop(), 'utf-8') #TODO Currently only one session is supported.
+            session_usage_key = f"PP:EdgeEye:sessions:{message['nid']}:{epoch}:session:{dev_eui}"
+            if await r.get(session_usage_key) is None:
+                print(f"[{TAG}:{message['nid']}:{sense_time}] resend the session")
+                session = await get_existing_session(dev_eui)
+                await r.set(session_usage_key, 0, ex=10)
+
+                #It seems the additional session information is not reached out to the device.
+                dev_addr = bytearray.fromhex(session['dev_addr'])
+                dev_addr.reverse()
+                nwkskey = bytes.fromhex(session['nwkskey'])
+                appskey = bytes.fromhex(session['appskey'])
+                await pyiotown.post.async_command(iotown_url, iotown_token,
+                                                  message['nid'],
+                                                  raw[1:6] + dev_addr + nwkskey + appskey,
+                                                  lorawan={ 'f_port': 5, 'confirmed': False },
+                                                  group_id=message['grpid'],
+                                                  verify=False)
+        
     missing_blocks = await r.get(missing_blocks_key)
     try:
         missing_blocks = json.loads(missing_blocks)
@@ -343,7 +513,6 @@ async def async_post_process(message):
     rtsp_last_buffer_key = rtsp_buffer_key + ':last'
     rtsp_last_timestamp_key = rtsp_timestamp_key + ':last'
 
-    last_frag = ((flags & (1 << 1)) != 0)
     if last_frag:
         if first_frag == False:
             await r.setrange(image_buffer_key, offset, frag)
