@@ -10,7 +10,7 @@ import redis.asyncio as redis
 from urllib.parse import urlparse
 import io
 from PIL import ImageFile
-from PIL import Image, ImageDraw
+from PIL import Image
 import sys
 import asyncio
 import aiohttp
