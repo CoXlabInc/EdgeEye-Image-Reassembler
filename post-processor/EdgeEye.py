@@ -14,6 +14,7 @@ from PIL import Image
 import sys
 import asyncio
 import aiohttp
+from aiohttp import web
 import threading
 import jwt
 import secrets
@@ -37,6 +38,7 @@ def init(url, pp_name, mqtt_url, redis_url, chirpstack=None, dry_run=False):
 
     global event_loop
     event_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(event_loop)
 
     def event_loop_thread():
         event_loop.run_forever()
@@ -53,18 +55,50 @@ def init(url, pp_name, mqtt_url, redis_url, chirpstack=None, dry_run=False):
             'username': url_parsed.username,
             'password': url_parsed.password
         }
-        #print(f"Chirpstack is used: {chirp}")
-        def logged_in(future):
-            token = future.result()
-            if token is not None:
-                print("Login to chirpstack success")
-            else:
+
+        async def start_web_server(app):
+            token = await chirpstack_login()
+            if token is None:
                 print("Login to chirpstack failed")
+                return
+            print("Chirpstack is detected")
+            runner = aiohttp.web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, port=58853)
+            await site.start()
+            
+            print(f"Run the web server...")
+            r = redis.Redis(connection_pool=pool)
+            await r.aclose()
+            await asyncio.Event().wait() # wait forever
         
-        asyncio.run_coroutine_threadsafe(chirpstack_login(), event_loop).add_done_callback(logged_in)
+        asyncio.run_coroutine_threadsafe(start_web_server(aiohttp_server()), event_loop)
 
     return pyiotown.post_process.connect_common(url, pp_name, post_process, mqtt_url=mqtt_url, dry_run=dry_run)
 
+def aiohttp_server():
+    print("Creating web app")
+    routes = web.RouteTableDef()
+
+    @routes.post('/')
+    async def hello(request):
+        r = redis.Redis(connection_pool=pool)
+        body = await request.read()
+        data = json.loads(body)
+        print(data)
+        if data.get('applicationID') == '8':
+            dev_eui = base64.b64decode(data['devEUI']).hex()
+            parent = await r.get(f"PP:EdgeEye:sessions:{dev_eui}:parent")
+            print(f"{dev_eui}'s parent is {parent}.")
+            await delete_all_downlinks(dev_eui)
+
+        await r.aclose()
+        return web.Response()
+
+    app = web.Application()
+    app.add_routes(routes)
+    return app
+    
 async def chirpstack_login():
     async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=True, verify_ssl=False)) as session:
         async with session.post(chirp['url'] + '/api/internal/login',
@@ -172,10 +206,10 @@ async def create_new_session():
                 print(content)
 
         async with session.delete(chirp['url'] + f"/api/devices/{dev_eui}",
-                                headers={
-                                    'Accept': 'application/json',
-                                    'Grpc-Metadata-Authorization': 'Bearer ' + token
-                                }) as response:
+                                  headers={
+                                      'Accept': 'application/json',
+                                      'Grpc-Metadata-Authorization': 'Bearer ' + token
+                                  }) as response:
             content = await response.text()
 
             try:
@@ -215,6 +249,28 @@ async def get_existing_session(dev_eui):
             else:
                 print(content)
                 return None
+
+async def delete_all_downlinks(dev_eui):
+    token = await chirpstack_login()
+    print(f"dev_eui:{dev_eui}")
+    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=True, verify_ssl=False)) as session:
+        async with session.delete(chirp['url'] + f'/api/devices/{dev_eui}/queue',
+                                  headers={
+                                      'Accept': 'application/json',
+                                      'Grpc-Metadata-Authorization': 'Bearer ' + token
+                                  }) as response:
+            content = await response.text()
+
+            try:
+                content = json.loads(content)
+            except:
+                pass
+            
+            if response.status == 200:
+                return True
+            else:
+                print(content)
+                return False
     
 async def async_post_process(message):
     r = redis.Redis(connection_pool=pool)
@@ -343,6 +399,7 @@ async def async_post_process(message):
 
     first_frag = ((flags & (1 << 0)) != 0)
     last_frag = ((flags & (1 << 1)) != 0)
+    multisession = ((flags & (1 << 4)) != 0)
 
     if first_frag:
         total_size = offset
@@ -357,7 +414,7 @@ async def async_post_process(message):
             offset_next = 0
             total_size = 0
 
-    if not first_frag or not last_frag:
+    if multisession:
         sessions_key = f"PP:EdgeEye:sessions:{message['nid']}:{epoch}"
         sessions = await r.smembers(sessions_key)
         print(f"[{TAG}:{message['nid']}:{sense_time}] assigned sessions: {sessions}")
@@ -366,8 +423,10 @@ async def async_post_process(message):
             if session is not None:
                 await r.sadd(sessions_key, session['dev_eui'])
 
-                session_usage_key = f"PP:EdgeEye:sessions:{message['nid']}:{epoch}:session:{session['dev_eui']}"
+                session_usage_key = f"PP:EdgeEye:sessions:{session['dev_eui']}:usage"
                 await r.set(session_usage_key, 0, ex=10)
+                session_parent_key = f"PP:EdgeEye:sessions:{session['dev_eui']}:parent"
+                await r.set(session_parent_key, message['nid'])
                 
                 #Send the additional session to the device.
                 dev_addr = bytearray.fromhex(session['dev_addr'])
@@ -384,11 +443,13 @@ async def async_post_process(message):
                 print(f"[{TAG}:{message['nid']}:{sense_time}] creating session failed")
         else:
             dev_eui = str(sessions.pop(), 'utf-8') #TODO Currently only one session is supported.
-            session_usage_key = f"PP:EdgeEye:sessions:{message['nid']}:{epoch}:session:{dev_eui}"
+            session_usage_key = f"PP:EdgeEye:sessions:{dev_eui}:usage"
             if await r.get(session_usage_key) is None:
                 print(f"[{TAG}:{message['nid']}:{sense_time}] resend the session")
                 session = await get_existing_session(dev_eui)
                 await r.set(session_usage_key, 0, ex=10)
+                session_parent_key = f"PP:EdgeEye:sessions:{dev_eui}:parent"
+                await r.set(session_parent_key, message['nid'])
 
                 #It seems the additional session information is not reached out to the device.
                 dev_addr = bytearray.fromhex(session['dev_addr'])
