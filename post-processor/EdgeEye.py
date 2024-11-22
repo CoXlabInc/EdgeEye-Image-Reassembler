@@ -18,6 +18,7 @@ from aiohttp import web
 import threading
 import jwt
 import secrets
+import traceback
 
 TAG = 'EdgeEye'
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -68,9 +69,6 @@ def init(url, pp_name, mqtt_url, redis_url, chirpstack=None, dry_run=False):
             await site.start()
             
             print(f"Run the web server...")
-            r = redis.Redis(connection_pool=pool)
-            await r.aclose()
-            await asyncio.Event().wait() # wait forever
         
         asyncio.run_coroutine_threadsafe(start_web_server(aiohttp_server()), event_loop)
 
@@ -81,16 +79,38 @@ def aiohttp_server():
     routes = web.RouteTableDef()
 
     @routes.post('/')
-    async def hello(request):
+    async def on_multisession_uplink(request):
         r = redis.Redis(connection_pool=pool)
         body = await request.read()
         data = json.loads(body)
         print(data)
         if data.get('applicationID') == '8':
             dev_eui = base64.b64decode(data['devEUI']).hex()
-            parent = await r.get(f"PP:EdgeEye:sessions:{dev_eui}:parent")
-            print(f"{dev_eui}'s parent is {parent}.")
+            parent = str(await r.get(f"PP:EdgeEye:sessions:{dev_eui}:parent"), 'utf-8')
             await delete_all_downlinks(dev_eui)
+
+            usage = int(await r.get(f"PP:EdgeEye:sessions:{dev_eui}:usage"))
+            print(f"{dev_eui} usage:{usage}, parent:{parent}.")
+            if usage == 0:
+                # Remove expiry
+                await r.set(f"PP:EdgeEye:sessions:{dev_eui}:usage", usage + 1)
+                await r.set(f"PP:EdgeEye:sessions:{dev_eui}:parent", parent)
+            else:
+                await r.incr(f"PP:EdgeEye:sessions:{dev_eui}:usage")
+
+            parent = parent.split(',')
+            if data.get('fPort') == 1 and data.get('data') is not None:
+                pending = await r.get(f"PP:EdgeEye:pending:{parent[1]}")
+
+                try:
+                    pending = json.loads(pending)
+                except:
+                    pending = []
+
+                pending.append(data['data'])
+
+                # await r.set(f"PP:EdgeEye:pending:{parent[1]}", json.dumps(pending), ex=3600)
+                # print(f"[{TAG}:{parent[1]}] pending: {pending}")
 
         await r.aclose()
         return web.Response()
@@ -252,7 +272,6 @@ async def get_existing_session(dev_eui):
 
 async def delete_all_downlinks(dev_eui):
     token = await chirpstack_login()
-    print(f"dev_eui:{dev_eui}")
     async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=True, verify_ssl=False)) as session:
         async with session.delete(chirp['url'] + f'/api/devices/{dev_eui}/queue',
                                   headers={
@@ -272,6 +291,42 @@ async def delete_all_downlinks(dev_eui):
                 print(content)
                 return False
     
+async def cleanup_old_sessions(nid, current_epoch=None):
+    r = redis.Redis(connection_pool=pool)
+
+    existing_epoch = int(await r.get(f"PP:EdgeEye:sessions:{nid}:time"))
+    # print(f"Current:{current_epoch} vs. Existing:{existing_epoch}")
+    if current_epoch is not None and existing_epoch == current_epoch:
+        await r.aclose()
+        return
+    
+    token = await chirpstack_login()
+    sessions = await r.lrange(f"PP:EdgeEye:sessions:{nid}", 0, -1)
+    for dev_eui in sessions:
+        dev_eui = str(dev_eui, 'utf-8')
+        print(f"Deleting {dev_eui} for {nid}...")
+        await r.delete(f"PP:EdgeEye:sessions:{dev_eui}:usage")
+        await r.delete(f"PP:EdgeEye:sessions:{dev_eui}:parent")
+
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=True, verify_ssl=False)) as session:
+            async with session.delete(chirp['url'] + f'/api/devices/{dev_eui}',
+                                      headers={
+                                          'Accept': 'application/json',
+                                          'Grpc-Metadata-Authorization': 'Bearer ' + token
+                                      }) as response:
+                content = await response.text()
+
+                try:
+                    content = json.loads(content)
+                except:
+                    pass
+            
+                if response.status != 200:
+                    print(f"Deleting {dev_eui} failed: {content}")
+    await r.delete(f"PP:EdgeEye:sessions:{nid}")
+    await r.delete(f"PP:EdgeEye:sessions:{nid}:time")
+    await r.aclose()
+
 async def async_post_process(message):
     r = redis.Redis(connection_pool=pool)
     
@@ -415,18 +470,22 @@ async def async_post_process(message):
             total_size = 0
 
     if multisession:
-        sessions_key = f"PP:EdgeEye:sessions:{message['nid']}:{epoch}"
-        sessions = await r.smembers(sessions_key)
+        await cleanup_old_sessions(message['nid'], current_epoch=epoch)
+        sessions_key = f"PP:EdgeEye:sessions:{message['nid']}"
+        sessions = await r.lrange(sessions_key, 0, -1)
         print(f"[{TAG}:{message['nid']}:{sense_time}] assigned sessions: {sessions}")
         if len(sessions) == 0:
             session = await create_new_session()
             if session is not None:
-                await r.sadd(sessions_key, session['dev_eui'])
+                await r.delete(sessions_key)
+                await r.rpush(sessions_key, session['dev_eui'])
+                await r.set(sessions_key + ":time", epoch)
 
+                print(f"[{TAG}:{message['nid']}:{sense_time}] session created: {session['dev_eui']}")
                 session_usage_key = f"PP:EdgeEye:sessions:{session['dev_eui']}:usage"
                 await r.set(session_usage_key, 0, ex=10)
                 session_parent_key = f"PP:EdgeEye:sessions:{session['dev_eui']}:parent"
-                await r.set(session_parent_key, message['nid'])
+                await r.set(session_parent_key, f"{message['grpid']},{message['nid']},{message['key']}", ex=10)
                 
                 #Send the additional session to the device.
                 dev_addr = bytearray.fromhex(session['dev_addr'])
@@ -442,14 +501,14 @@ async def async_post_process(message):
             else:
                 print(f"[{TAG}:{message['nid']}:{sense_time}] creating session failed")
         else:
-            dev_eui = str(sessions.pop(), 'utf-8') #TODO Currently only one session is supported.
+            dev_eui = str(sessions[0], 'utf-8') #TODO Currently only one session is supported.
             session_usage_key = f"PP:EdgeEye:sessions:{dev_eui}:usage"
             if await r.get(session_usage_key) is None:
                 print(f"[{TAG}:{message['nid']}:{sense_time}] resend the session")
                 session = await get_existing_session(dev_eui)
                 await r.set(session_usage_key, 0, ex=10)
                 session_parent_key = f"PP:EdgeEye:sessions:{dev_eui}:parent"
-                await r.set(session_parent_key, message['nid'])
+                await r.set(session_parent_key, f"{message['grpid']},{message['nid']},{message['key']}", ex=10)
 
                 #It seems the additional session information is not reached out to the device.
                 dev_addr = bytearray.fromhex(session['dev_addr'])
@@ -558,7 +617,12 @@ async def async_post_process(message):
     message['data']['meta_total'] = meta
 
     if len(meta) > 1:
-        fcnts = list(range(meta[0]['fCnt'], meta[-1]['fCnt'] + 1))
+        try:
+            fcnts = list(range(meta[0]['fCnt'], meta[-1]['fCnt'] + 1))
+        except Exception as e:
+            print(traceback.format_exc())
+            print(f"meta[0]:{meta[0]} ~ meta[-1]:{meta[-1]}")
+            raise e
         fcnts_missing = fcnts.copy()
         for m in meta:
             fcnts_missing.remove(m['fCnt'])
@@ -653,7 +717,7 @@ async def async_post_process(message):
     await r.delete(mutex_key)
     
     if prev_data is not None:
-        result = pyiotown.delete.data(iotown_url, iotown_token, _id=prev_data_id, group_id=message['grpid'], verify=False)
+        result = await pyiotown.delete.async_data(iotown_url, iotown_token, _id=prev_data_id, group_id=message['grpid'], verify=False)
         #print(f"[{TAG}] delete prev data _id:${prev_data_id}: {result}")
         
     await r.aclose()
