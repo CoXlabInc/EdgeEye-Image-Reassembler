@@ -109,8 +109,8 @@ def aiohttp_server():
 
                 pending.append(data['data'])
 
-                # await r.set(f"PP:EdgeEye:pending:{parent[1]}", json.dumps(pending), ex=3600)
-                # print(f"[{TAG}:{parent[1]}] pending: {pending}")
+                await r.set(f"PP:EdgeEye:pending:{parent[1]}", json.dumps(pending), ex=3600)
+                print(f"[{TAG}:{parent[1]}] pending: {pending}")
 
         await r.aclose()
         return web.Response()
@@ -528,6 +528,37 @@ async def async_post_process(message):
     except:
         missing_blocks = []
 
+    pending = await r.get(f"PP:EdgeEye:pending:{message['nid']}")
+    try:
+        pending = json.loads(pending)
+    except:
+        pending = []
+
+    pending.reverse()
+    for p in pending:
+        p = base64.b64decode(p)
+        if len(p) < 9:
+            print(f"too small pending block ({len(p)})")
+            continue
+
+        p_epoch = int.from_bytes(p[1:6], 'little', signed=False)
+        p_offset = int.from_bytes(p[6:9], 'little', signed=False)
+        p_raw = p[9:]
+        print(f"pending block offset:{p_offset}, length:{len(p_raw)}")
+
+        if p_epoch != epoch:
+            print("pending block sense_time mismatch")
+            continue
+        
+        if p_offset + len(p_raw) != offset:
+            print(f"offset mismatch ({offset - len(p_raw)}) expected but {p_offset}")
+            continue
+
+        frag = p_raw + frag
+        offset = p_offset
+        print(f"[{TAG}:{message['nid']}] Added pending block from other sessions. offset:{offset + len(p_raw)}->{offset}, len:{len(frag) - len(p_raw)}->{len(frag)}")
+    await r.delete(f"PP:EdgeEye:pending:{message['nid']}")
+    
     offset_end = offset + len(frag)
 
     print(f"[{TAG}:{message['nid']}:{sense_time}] current(first:{first_frag}):{offset}~{offset_end}, max pos:{offset_next}, total size:{total_size}")
