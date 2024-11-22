@@ -109,7 +109,7 @@ def aiohttp_server():
 
                 pending.append(data['data'])
 
-                await r.set(f"PP:EdgeEye:pending:{parent[1]}", json.dumps(pending), ex=3600)
+                await r.set(f"PP:EdgeEye:pending:{parent[1]}", json.dumps(pending), timedelta(hours=1))
                 print(f"[{TAG}:{parent[1]}] pending: {pending}")
 
         await r.aclose()
@@ -395,7 +395,6 @@ async def async_post_process(message):
     epoch = int.from_bytes(raw[1:6], 'little', signed=False)
     offset = int.from_bytes(raw[6:9], 'little', signed=False)
 
-    total_size_key = f"PP:EdgeEye:size:{message['nid']}:{epoch}"
     missing_blocks_key = f"PP:EdgeEye:missing:{message['nid']}:{epoch}"
 
     i = 9
@@ -460,14 +459,20 @@ async def async_post_process(message):
         total_size = offset
         offset = 0
     elif total_size is None:
-        # to keep backward compatible
-        total_size = await r.get(total_size_key)
-        if total_size is not None:
-            total_size = int(total_size)
-        else:
-            print(f"[{TAG}:{message['nid']}] GET '{total_size_key}' returned None")
-            offset_next = 0
-            total_size = 0
+        # There is no prev data caused by the DB inconsistency.
+        await r.aclose()
+        return None
+
+    if last_frag and len(frag) == 0:
+        await pyiotown.post.async_command(iotown_url,
+                                          iotown_token,
+                                          message['nid'],
+                                          epoch.to_bytes(5, byteorder='little', signed=False),
+                                          lorawan={ 'f_port': 4, 'confirmed': False },
+                                          group_id= message['grpid'],
+                                          verify=False)
+        await r.aclose()
+        return None
 
     if multisession:
         await cleanup_old_sessions(message['nid'], current_epoch=epoch)
@@ -705,6 +710,15 @@ async def async_post_process(message):
                 await r.delete(missing_blocks_key)
                 await r.delete(image_buffer_key)
                 print(f"[{TAG}:{message['nid']}:{sense_time}] image reassembly completed (fcnt:{fcnt}, size:{len(jpeg_completed)})")
+                await r.set(f"PP:EdgeEye:completed:{message['nid']}:{epoch}", 0, ex=timedelta(hours=24))
+                await pyiotown.post.async_command(iotown_url,
+                                                  iotown_token,
+                                                  message['nid'],
+                                                  epoch.to_bytes(5, byteorder='little', signed=False),
+                                                  lorawan={ 'f_port': 4, 'confirmed': False },
+                                                  group_id= message['grpid'],
+                                                  verify=False)
+                
     else:
         await r.setrange(image_buffer_key, offset, frag)
 
