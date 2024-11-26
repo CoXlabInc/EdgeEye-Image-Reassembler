@@ -294,11 +294,13 @@ async def delete_all_downlinks(dev_eui):
 async def cleanup_old_sessions(nid, current_epoch=None):
     r = redis.Redis(connection_pool=pool)
 
-    existing_epoch = int(await r.get(f"PP:EdgeEye:sessions:{nid}:time"))
-    # print(f"Current:{current_epoch} vs. Existing:{existing_epoch}")
-    if current_epoch is not None and existing_epoch == current_epoch:
-        await r.aclose()
-        return
+    existing_epoch = await r.get(f"PP:EdgeEye:sessions:{nid}:time")
+    if existing_epoch is not None:
+        existing_epoch = int(existing_epoch)
+        # print(f"Current:{current_epoch} vs. Existing:{existing_epoch}")
+        if current_epoch is not None and existing_epoch == current_epoch:
+            await r.aclose()
+            return
     
     token = await chirpstack_login()
     sessions = await r.lrange(f"PP:EdgeEye:sessions:{nid}", 0, -1)
@@ -395,8 +397,6 @@ async def async_post_process(message):
     epoch = int.from_bytes(raw[1:6], 'little', signed=False)
     offset = int.from_bytes(raw[6:9], 'little', signed=False)
 
-    missing_blocks_key = f"PP:EdgeEye:missing:{message['nid']}:{epoch}"
-
     i = 9
     
     if (flags & (1 << 2)) == 0:
@@ -410,8 +410,23 @@ async def async_post_process(message):
     else:
         als = int.from_bytes(raw[i:i+3], 'little', signed=False)
         i += 3
+ 
+    first_frag = ((flags & (1 << 0)) != 0)
+    last_frag = ((flags & (1 << 1)) != 0)
+    multisession = ((flags & (1 << 4)) != 0)
 
     frag = raw[i:]
+
+    if last_frag and len(frag) == 0:
+        await pyiotown.post.async_command(iotown_url,
+                                          iotown_token,
+                                          message['nid'],
+                                          epoch.to_bytes(5, byteorder='little', signed=False),
+                                          lorawan={ 'f_port': 4, 'confirmed': False },
+                                          group_id= message['grpid'],
+                                          verify=False)
+        await r.aclose()
+        return None
 
     sense_time = datetime.utcfromtimestamp(epoch).isoformat() + 'Z'
     message['data']['sense_time'] = sense_time
@@ -451,28 +466,27 @@ async def async_post_process(message):
         total_size = None
         meta = []
 
-    first_frag = ((flags & (1 << 0)) != 0)
-    last_frag = ((flags & (1 << 1)) != 0)
-    multisession = ((flags & (1 << 4)) != 0)
+    image_buffer_key = f"PP:EdgeEye:buffer:{message['nid']}:{epoch}"
 
     if first_frag:
         total_size = offset
         offset = 0
     elif total_size is None:
-        # There is no prev data caused by the DB inconsistency.
+        image_in_reassembly = await r.exists(image_buffer_key)
+        if image_in_reassembly == 0:
+            print(f"[{TAG}:{message['nid']}:{sense_time}] Missing the first fragment")
+            frag_req = raw[1:6] + b'\x00\x00\x00'
+            await pyiotown.post.async_command(iotown_url, iotown_token,
+                                              message['nid'],
+                                              frag_req,
+                                              lorawan={ 'f_port': 4, 'confirmed': False },    # fragment request
+                                              group_id=message['grpid'],
+                                              verify=False)
+        else:
+            print(f"[{TAG}:{message['nid']}:{sense_time}] There is no prev data caused by the DB inconsistency. ({image_in_reassembly})")
         await r.aclose()
         return None
-
-    if last_frag and len(frag) == 0:
-        await pyiotown.post.async_command(iotown_url,
-                                          iotown_token,
-                                          message['nid'],
-                                          epoch.to_bytes(5, byteorder='little', signed=False),
-                                          lorawan={ 'f_port': 4, 'confirmed': False },
-                                          group_id= message['grpid'],
-                                          verify=False)
-        await r.aclose()
-        return None
+            
 
     if multisession:
         await cleanup_old_sessions(message['nid'], current_epoch=epoch)
@@ -527,6 +541,7 @@ async def async_post_process(message):
                                                   group_id=message['grpid'],
                                                   verify=False)
         
+    missing_blocks_key = f"PP:EdgeEye:missing:{message['nid']}:{epoch}"
     missing_blocks = await r.get(missing_blocks_key)
     try:
         missing_blocks = json.loads(missing_blocks)
@@ -668,7 +683,6 @@ async def async_post_process(message):
     end_time = datetime.now()
     message['data']['sec_taken'] = end_time.timestamp() - start_time.timestamp()
     
-    image_buffer_key = f"PP:EdgeEye:buffer:{message['nid']}:{epoch}"
     rtsp_buffer_key = f"ImageToRtsp:{message['nid']}:image"
     rtsp_timestamp_key = f"ImageToRtsp:{message['nid']}:sense_time"
     rtsp_last_buffer_key = rtsp_buffer_key + ':last'
