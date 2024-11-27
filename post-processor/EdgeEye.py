@@ -418,7 +418,7 @@ async def async_post_process(message):
 
     frag = raw[i:]
 
-    if last_frag and len(frag) == 0:
+    if first_frag == False and last_frag and len(frag) == 0:
         await pyiotown.post.async_command(iotown_url,
                                           iotown_token,
                                           message['nid'],
@@ -490,7 +490,7 @@ async def async_post_process(message):
         return None
             
 
-    if multisession:
+    if multisession and (first_frag == False or last_frag == False):
         await cleanup_old_sessions(message['nid'], current_epoch=epoch)
         sessions_key = f"PP:EdgeEye:sessions:{message['nid']}"
         sessions = await r.lrange(sessions_key, 0, -1)
@@ -603,8 +603,8 @@ async def async_post_process(message):
 
         if offset > offset_next:
             print(f"[{TAG}:{message['nid']}:{sense_time}] {offset_next} expected but {offset}. add a missing block")
-            if (offset_next, offset) not in missing_blocks:
-                missing_blocks.append((offset_next, offset))
+            if [offset_next, offset] not in missing_blocks:
+                missing_blocks.append([offset_next, offset])
         elif offset < offset_next:
             # remove missing blocks
             updated_missing_blocks = []
@@ -615,17 +615,14 @@ async def async_post_process(message):
                     print("Found!")
                     continue
                 elif offset <= b[0] and b[0] < offset_end and offset_end < b[1]:
-                    # shrinks head
                     print("shrinks head")
                     b[0] = offset_end
                     updated_missing_blocks.append(b)
                 elif b[0] < offset and offset < b[1] and b[1] <= offset_end:
-                    # shrinks tail
                     print("shirnks tail")
                     b[1] = offset
                     updated_missing_blocks.append(b)
                 elif offset > b[0] and offset_end < b[1]:
-                    # splits
                     print("split")
                     c = [offset_end, b[1]]
                     updated_missing_blocks.append(c)
@@ -633,7 +630,6 @@ async def async_post_process(message):
                     updated_missing_blocks.append(b)
                 else:
                     print("out of range")
-                    # out of range
                     updated_missing_blocks.append(b)
             missing_blocks = updated_missing_blocks
 
@@ -704,7 +700,9 @@ async def async_post_process(message):
     rtsp_last_timestamp_key = rtsp_timestamp_key + ':last'
 
     if last_frag:
-        if first_frag == False:
+        if first_frag:
+            print(f"[{TAG}:{message['nid']}:{sense_time}] empty image (fcnt:{fcnt})")
+        else:
             image = (await r.get(image_buffer_key))[:reassembled_offset]
 
             try:
