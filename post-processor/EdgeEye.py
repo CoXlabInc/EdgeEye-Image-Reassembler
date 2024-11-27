@@ -83,10 +83,11 @@ def aiohttp_server():
         r = redis.Redis(connection_pool=pool)
         body = await request.read()
         data = json.loads(body)
-        print(data)
-        if data.get('applicationID') == '8':
-            dev_eui = base64.b64decode(data['devEUI']).hex()
-            parent = str(await r.get(f"PP:EdgeEye:sessions:{dev_eui}:parent"), 'utf-8')
+        dev_eui = base64.b64decode(data['devEUI']).hex()
+        parent = await r.get(f"PP:EdgeEye:sessions:{dev_eui}:parent")
+        # print(data)
+        if data.get('applicationID') == '8' and parent is not None:
+            parent = str(parent, 'utf-8')
             await delete_all_downlinks(dev_eui)
 
             usage = int(await r.get(f"PP:EdgeEye:sessions:{dev_eui}:usage"))
@@ -94,9 +95,9 @@ def aiohttp_server():
             if usage == 0:
                 # Remove expiry
                 await r.set(f"PP:EdgeEye:sessions:{dev_eui}:usage", usage + 1)
-                await r.set(f"PP:EdgeEye:sessions:{dev_eui}:parent", parent)
             else:
                 await r.incr(f"PP:EdgeEye:sessions:{dev_eui}:usage")
+            await r.set(f"PP:EdgeEye:sessions:{dev_eui}:parent", parent)
 
             parent = parent.split(',')
             if data.get('fPort') == 1 and data.get('data') is not None:
@@ -511,7 +512,7 @@ async def async_post_process(message):
                 session_usage_key = f"PP:EdgeEye:sessions:{session['dev_eui']}:usage"
                 await r.set(session_usage_key, 0, ex=10)
                 session_parent_key = f"PP:EdgeEye:sessions:{session['dev_eui']}:parent"
-                await r.set(session_parent_key, f"{message['grpid']},{message['nid']},{message['key']}", ex=10)
+                await r.set(session_parent_key, f"{message['grpid']},{message['nid']},{message['key']}")
                 
                 #Send the additional session to the device.
                 dev_addr = bytearray.fromhex(session['dev_addr'])
@@ -544,7 +545,7 @@ async def async_post_process(message):
                     session = await get_existing_session(dev_eui)
                     await r.set(session_usage_key, 0, ex=10)
                     session_parent_key = f"PP:EdgeEye:sessions:{dev_eui}:parent"
-                    await r.set(session_parent_key, f"{message['grpid']},{message['nid']},{message['key']}", ex=10)
+                    await r.set(session_parent_key, f"{message['grpid']},{message['nid']},{message['key']}")
 
                     dev_addr = bytearray.fromhex(session['dev_addr'])
                     dev_addr.reverse()
