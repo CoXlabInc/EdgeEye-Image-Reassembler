@@ -471,6 +471,7 @@ async def async_post_process(message):
     if first_frag:
         total_size = offset
         offset = 0
+        await r.delete(f"PP:EdgeEye:pending:{message['nid']}")
     elif total_size is None:
         image_in_reassembly = await r.exists(image_buffer_key)
         if image_in_reassembly == 0:
@@ -494,9 +495,15 @@ async def async_post_process(message):
         sessions = await r.lrange(sessions_key, 0, -1)
         print(f"[{TAG}:{message['nid']}:{sense_time}] assigned sessions: {sessions}")
         if len(sessions) == 0:
-            session = await create_new_session()
-            if session is not None:
-                await r.delete(sessions_key)
+            await r.delete(sessions_key)
+
+            session_response = raw[1:6]
+            
+            for i in range(2):
+                session = None
+                while session is None:
+                    session = await create_new_session()
+
                 await r.rpush(sessions_key, session['dev_eui'])
                 await r.set(sessions_key + ":time", epoch)
 
@@ -511,32 +518,43 @@ async def async_post_process(message):
                 dev_addr.reverse()
                 nwkskey = bytes.fromhex(session['nwkskey'])
                 appskey = bytes.fromhex(session['appskey'])
-                await pyiotown.post.async_command(iotown_url, iotown_token,
-                                                  message['nid'],
-                                                  raw[1:6] + dev_addr + nwkskey + appskey,
-                                                  lorawan={ 'f_port': 5, 'confirmed': False },
-                                                  group_id=message['grpid'],
-                                                  verify=False)
-            else:
-                print(f"[{TAG}:{message['nid']}:{sense_time}] creating session failed")
+                session_response += dev_addr + nwkskey + appskey
+                
+            await pyiotown.post.async_command(iotown_url, iotown_token,
+                                              message['nid'],
+                                              session_response,
+                                              lorawan={ 'f_port': 5, 'confirmed': False },
+                                              group_id=message['grpid'],
+                                              verify=False)
         else:
-            dev_eui = str(sessions[0], 'utf-8') #TODO Currently only one session is supported.
-            session_usage_key = f"PP:EdgeEye:sessions:{dev_eui}:usage"
-            if await r.get(session_usage_key) is None:
-                print(f"[{TAG}:{message['nid']}:{sense_time}] resend the session")
-                session = await get_existing_session(dev_eui)
-                await r.set(session_usage_key, 0, ex=10)
-                session_parent_key = f"PP:EdgeEye:sessions:{dev_eui}:parent"
-                await r.set(session_parent_key, f"{message['grpid']},{message['nid']},{message['key']}", ex=10)
-
+            session_response = None
+            for dev_eui in sessions:
+                dev_eui = str(dev_eui, 'utf-8')
+                session_usage_key = f"PP:EdgeEye:sessions:{dev_eui}:usage"
+                if await r.get(session_usage_key) is None:
+                    session_response = raw[1:6]
+                    break
+                
+            if session_response is not None:
                 #It seems the additional session information is not reached out to the device.
-                dev_addr = bytearray.fromhex(session['dev_addr'])
-                dev_addr.reverse()
-                nwkskey = bytes.fromhex(session['nwkskey'])
-                appskey = bytes.fromhex(session['appskey'])
+                print(f"[{TAG}:{message['nid']}:{sense_time}] resend the session")
+                
+                for dev_eui in sessions:
+                    dev_eui = str(dev_eui, 'utf-8')
+                    session = await get_existing_session(dev_eui)
+                    await r.set(session_usage_key, 0, ex=10)
+                    session_parent_key = f"PP:EdgeEye:sessions:{dev_eui}:parent"
+                    await r.set(session_parent_key, f"{message['grpid']},{message['nid']},{message['key']}", ex=10)
+
+                    dev_addr = bytearray.fromhex(session['dev_addr'])
+                    dev_addr.reverse()
+                    nwkskey = bytes.fromhex(session['nwkskey'])
+                    appskey = bytes.fromhex(session['appskey'])
+                    session_response += dev_addr + nwkskey + appskey
+                    
                 await pyiotown.post.async_command(iotown_url, iotown_token,
                                                   message['nid'],
-                                                  raw[1:6] + dev_addr + nwkskey + appskey,
+                                                  session_response,
                                                   lorawan={ 'f_port': 5, 'confirmed': False },
                                                   group_id=message['grpid'],
                                                   verify=False)
@@ -548,13 +566,14 @@ async def async_post_process(message):
     except:
         missing_blocks = []
 
+    pending_blocks = []
+    
     pending = await r.get(f"PP:EdgeEye:pending:{message['nid']}")
     try:
         pending = json.loads(pending)
     except:
         pending = []
 
-    pending.reverse()
     for p in pending:
         p = base64.b64decode(p)
         if len(p) < 9:
@@ -564,70 +583,70 @@ async def async_post_process(message):
         p_epoch = int.from_bytes(p[1:6], 'little', signed=False)
         p_offset = int.from_bytes(p[6:9], 'little', signed=False)
         p_raw = p[9:]
-        print(f"pending block offset:{p_offset}, length:{len(p_raw)}")
+        print(f"[{TAG}:{message['nid']}] pending block offset:{p_offset}, length:{len(p_raw)}")
 
         if p_epoch != epoch:
             print("pending block sense_time mismatch")
             continue
-        
-        if p_offset + len(p_raw) != offset:
-            print(f"offset mismatch ({offset - len(p_raw)}) expected but {p_offset}")
-            continue
 
-        frag = p_raw + frag
-        offset = p_offset
-        print(f"[{TAG}:{message['nid']}] Added pending block from other sessions. offset:{offset + len(p_raw)}->{offset}, len:{len(frag) - len(p_raw)}->{len(frag)}")
+        pending_blocks.append((p_offset, p_raw))
     await r.delete(f"PP:EdgeEye:pending:{message['nid']}")
-    
-    offset_end = offset + len(frag)
 
-    print(f"[{TAG}:{message['nid']}:{sense_time}] current(first:{first_frag}):{offset}~{offset_end}, max pos:{offset_next}, total size:{total_size}")
-    if offset > offset_next:
-        print(f"[{TAG}:{message['nid']}:{sense_time}] {offset_next} expected but {offset}. add a missing block")
-        if (offset_next, offset) not in missing_blocks:
-            missing_blocks.append((offset_next, offset))
-            await r.set(missing_blocks_key, json.dumps(missing_blocks), timedelta(hours=24))
-        else:
-            await r.expire(missing_blocks_key, timedelta(hours=24))
-    elif offset < offset_next:
-        # remove missing blocks
-        updated_missing_blocks = []
-        for b in missing_blocks:
-            print(f"[{TAG}:{message['nid']}:{sense_time}] missing:{b[0]}~{b[1]}, current:{offset}~{offset_end} => ", end="")
-            if offset <= b[0] and offset_end >= b[1]:
-                # The current includes the missing block
-                print("Found!")
-                continue
-            elif offset <= b[0] and b[0] < offset_end and offset_end < b[1]:
-                # shrinks head
-                print("shrinks head")
-                b[0] = offset_end
-                updated_missing_blocks.append(b)
-            elif b[0] < offset and offset < b[1] and b[1] <= offset_end:
-                # shrinks tail
-                print("shirnks tail")
-                b[1] = offset
-                updated_missing_blocks.append(b)
-            elif offset > b[0] and offset_end < b[1]:
-                # splits
-                print("split")
-                c = [offset_end, b[1]]
-                updated_missing_blocks.append(c)
-                b[1] = offset
-                updated_missing_blocks.append(b)
-            else:
-                print("out of range")
-                # out of range
-                updated_missing_blocks.append(b)
-        missing_blocks = updated_missing_blocks
-        if len(missing_blocks) > 0:
-            await r.set(missing_blocks_key, json.dumps(missing_blocks), timedelta(hours=24))
-        else:
-            await r.delete(missing_blocks_key)
+    pending_blocks.append((offset, frag)) # The current fragment must be placed at the end.
 
-    reassembled_offset = offset_next + len(frag)
+    for p in pending_blocks:
+        offset, frag = p
+        offset_end = offset + len(frag)
 
+        print(f"[{TAG}:{message['nid']}:{sense_time}] current(first:{first_frag}):{offset}~{offset_end}, max pos:{offset_next}, total size:{total_size}")
+
+        if offset > offset_next:
+            print(f"[{TAG}:{message['nid']}:{sense_time}] {offset_next} expected but {offset}. add a missing block")
+            if (offset_next, offset) not in missing_blocks:
+                missing_blocks.append((offset_next, offset))
+        elif offset < offset_next:
+            # remove missing blocks
+            updated_missing_blocks = []
+            for b in missing_blocks:
+                print(f"[{TAG}:{message['nid']}:{sense_time}] missing:{b[0]}~{b[1]}, current:{offset}~{offset_end} => ", end="")
+                if offset <= b[0] and offset_end >= b[1]:
+                    # The current includes the missing block
+                    print("Found!")
+                    continue
+                elif offset <= b[0] and b[0] < offset_end and offset_end < b[1]:
+                    # shrinks head
+                    print("shrinks head")
+                    b[0] = offset_end
+                    updated_missing_blocks.append(b)
+                elif b[0] < offset and offset < b[1] and b[1] <= offset_end:
+                    # shrinks tail
+                    print("shirnks tail")
+                    b[1] = offset
+                    updated_missing_blocks.append(b)
+                elif offset > b[0] and offset_end < b[1]:
+                    # splits
+                    print("split")
+                    c = [offset_end, b[1]]
+                    updated_missing_blocks.append(c)
+                    b[1] = offset
+                    updated_missing_blocks.append(b)
+                else:
+                    print("out of range")
+                    # out of range
+                    updated_missing_blocks.append(b)
+            missing_blocks = updated_missing_blocks
+
+        offset_next = int(await r.setrange(image_buffer_key, offset, frag))
+        reassembled_offset = offset_next
+        print(f"[{TAG}:{message['nid']}:{sense_time}] image reassembly in progress (fcnt:{fcnt}, +{len(frag)} bytes, {reassembled_offset}/{total_size} ({(reassembled_offset / total_size * 100) if total_size > 0 else 0:.2f}%))")
+        
     if len(missing_blocks) > 0:
+        for b in missing_blocks:
+            if b[0] < reassembled_offset:
+                reassembled_offset = b[0]
+
+        await r.set(missing_blocks_key, json.dumps(missing_blocks), timedelta(hours=24))
+
         success, result = await pyiotown.get.async_command(iotown_url, iotown_token, message['nid'],
                                                            group_id=message['grpid'], verify=False)
         if success == True:
@@ -643,9 +662,6 @@ async def async_post_process(message):
             print(f"[{TAG}:{message['nid']}:{sense_time}] There was packet loss. (fcnt:{fcnt}, missing:{missing_min[0]}~{missing_min[1]}, total:{total_size})")
             if command_status is not None and len(command_status) == 0:
                 frag_req = raw[1:6]
-                # if total_size == 0:
-                #     frag_req += b'\x00\x00\x00'
-                # else:
                 frag_req += ((missing_min[0]).to_bytes(3, byteorder='little', signed=False) +
                              (missing_min[1]).to_bytes(3, byteorder='little', signed=False))
                 await pyiotown.post.async_command(iotown_url, iotown_token,
@@ -656,10 +672,8 @@ async def async_post_process(message):
                                                   verify=False)
             # else:
             #     print(command_status)
-
-        for b in missing_blocks:
-            if b[0] < reassembled_offset:
-                reassembled_offset = b[0]
+    else:
+        await r.delete(missing_blocks_key)
 
     l = message['meta']
     del l['raw']
@@ -690,8 +704,6 @@ async def async_post_process(message):
 
     if last_frag:
         if first_frag == False:
-            await r.setrange(image_buffer_key, offset, frag)
-
             image = (await r.get(image_buffer_key))[:reassembled_offset]
 
             try:
@@ -734,8 +746,6 @@ async def async_post_process(message):
                                                   verify=False)
                 
     else:
-        await r.setrange(image_buffer_key, offset, frag)
-
         jpeg_raw = (await r.get(image_buffer_key))[:reassembled_offset]
 
         try:
@@ -766,13 +776,11 @@ async def async_post_process(message):
                 'file_size': len(jpeg_raw),
             }
 
-        message['data']['received'] = offset_end if offset_end > offset_next else offset_next
+        message['data']['received'] = offset_next
         message['data']['reassembled'] = reassembled_offset
         message['data']['total_size'] = total_size
 
         await r.expire(image_buffer_key, timedelta(hours=1))
-        print(f"[{TAG}:{message['nid']}:{sense_time}] image reassembly in progress (fcnt:{fcnt}, +{len(frag)} bytes, {reassembled_offset}/{total_size} ({(reassembled_offset / total_size * 100) if total_size > 0 else 0:.2f}%))")
-
     await r.delete(mutex_key)
     
     if prev_data is not None:
