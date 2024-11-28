@@ -417,19 +417,31 @@ async def async_post_process(message):
     multisession = ((flags & (1 << 4)) != 0)
 
     frag = raw[i:]
+    sense_time = datetime.utcfromtimestamp(epoch).isoformat() + 'Z'
 
-    if first_frag == False and last_frag and len(frag) == 0:
-        await pyiotown.post.async_command(iotown_url,
-                                          iotown_token,
-                                          message['nid'],
-                                          epoch.to_bytes(5, byteorder='little', signed=False),
-                                          lorawan={ 'f_port': 4, 'confirmed': False },
-                                          group_id= message['grpid'],
-                                          verify=False)
+    missing_blocks_key = f"PP:EdgeEye:missing:{message['nid']}:{epoch}"
+    missing_blocks = await r.get(missing_blocks_key)
+    try:
+        missing_blocks = json.loads(missing_blocks)
+    except:
+        missing_blocks = []
+
+    if first_frag == False and last_frag and len(frag) == 0 and len(missing_blocks) == 0:
+        if await r.get(f"PP:EdgeEye:completed:{message['nid']}:{epoch}") is not None:
+            await pyiotown.post.async_command(iotown_url,
+                                              iotown_token,
+                                              message['nid'],
+                                              epoch.to_bytes(5, byteorder='little', signed=False),
+                                              lorawan={ 'f_port': 4, 'confirmed': False },
+                                              group_id= message['grpid'],
+                                              verify=False)
+            print(f"[{TAG}:{message['nid']}:{sense_time}] Response nothing request as end of reassembly")
+        else:
+            print(f"[{TAG}:{message['nid']}:{sense_time}] Unknown epoch: {raw[1:6].hex()}")
+        await r.delete(mutex_key)
         await r.aclose()
         return None
 
-    sense_time = datetime.utcfromtimestamp(epoch).isoformat() + 'Z'
     message['data']['sense_time'] = sense_time
     message['data']['system_voltage'] = sysv
     message['data']['ambient_light_lux'] = als
@@ -486,6 +498,7 @@ async def async_post_process(message):
                                               verify=False)
         else:
             print(f"[{TAG}:{message['nid']}:{sense_time}] There is no prev data caused by the DB inconsistency. ({image_in_reassembly})")
+        await r.delete(mutex_key)
         await r.aclose()
         return None
             
@@ -560,12 +573,6 @@ async def async_post_process(message):
                                                   group_id=message['grpid'],
                                                   verify=False)
         
-    missing_blocks_key = f"PP:EdgeEye:missing:{message['nid']}:{epoch}"
-    missing_blocks = await r.get(missing_blocks_key)
-    try:
-        missing_blocks = json.loads(missing_blocks)
-    except:
-        missing_blocks = []
 
     pending_blocks = []
     
@@ -687,7 +694,10 @@ async def async_post_process(message):
             raise e
         fcnts_missing = fcnts.copy()
         for m in meta:
-            fcnts_missing.remove(m['fCnt'])
+            try:
+                fcnts_missing.remove(m['fCnt'])
+            except:
+                pass
         message['data']['prr'] = (len(fcnts) - len(fcnts_missing)) / len(fcnts) * 100
 
     start_time = datetime.strptime(sense_time, '%Y-%m-%dT%H:%M:%SZ')
@@ -743,7 +753,10 @@ async def async_post_process(message):
                                                   lorawan={ 'f_port': 4, 'confirmed': False },
                                                   group_id= message['grpid'],
                                                   verify=False)
-                
+            else:
+                message['data']['received'] = offset_next
+                message['data']['reassembled'] = reassembled_offset
+                message['data']['total_size'] = total_size
     else:
         jpeg_raw = (await r.get(image_buffer_key))[:reassembled_offset]
 
