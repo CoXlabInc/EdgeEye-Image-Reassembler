@@ -426,18 +426,15 @@ async def async_post_process(message):
     except:
         missing_blocks = []
 
-    if first_frag == False and last_frag and len(frag) == 0 and len(missing_blocks) == 0:
-        if await r.get(f"PP:EdgeEye:completed:{message['nid']}:{epoch}") is not None:
-            await pyiotown.post.async_command(iotown_url,
-                                              iotown_token,
-                                              message['nid'],
-                                              epoch.to_bytes(5, byteorder='little', signed=False),
-                                              lorawan={ 'f_port': 4, 'confirmed': False },
-                                              group_id= message['grpid'],
-                                              verify=False)
-            print(f"[{TAG}:{message['nid']}:{sense_time}] Response nothing request as end of reassembly")
-        else:
-            print(f"[{TAG}:{message['nid']}:{sense_time}] Unknown epoch: {raw[1:6].hex()}")
+    if await r.get(f"PP:EdgeEye:completed:{message['nid']}:{epoch}") is not None:
+        await pyiotown.post.async_command(iotown_url,
+                                          iotown_token,
+                                          message['nid'],
+                                          epoch.to_bytes(5, byteorder='little', signed=False),
+                                          lorawan={ 'f_port': 4, 'confirmed': False },
+                                          group_id= message['grpid'],
+                                          verify=False)
+        print(f"[{TAG}:{message['nid']}:{sense_time}] Response nothing request as end of reassembly")
         await r.delete(mutex_key)
         await r.aclose()
         return None
@@ -685,89 +682,24 @@ async def async_post_process(message):
 
     message['data']['meta_total'] = meta
 
-    if len(meta) > 1:
-        try:
-            fcnts = list(range(meta[0]['fCnt'], meta[-1]['fCnt'] + 1))
-        except Exception as e:
-            print(traceback.format_exc())
-            print(f"meta[0]:{meta[0]} ~ meta[-1]:{meta[-1]}")
-            raise e
-        fcnts_missing = fcnts.copy()
-        for m in meta:
-            try:
-                fcnts_missing.remove(m['fCnt'])
-            except:
-                pass
-        message['data']['prr'] = (len(fcnts) - len(fcnts_missing)) / len(fcnts) * 100
-
-    start_time = datetime.strptime(sense_time, '%Y-%m-%dT%H:%M:%SZ')
-    end_time = datetime.now()
-    message['data']['sec_taken'] = end_time.timestamp() - start_time.timestamp()
-    
     rtsp_buffer_key = f"ImageToRtsp:{message['nid']}:image"
     rtsp_timestamp_key = f"ImageToRtsp:{message['nid']}:sense_time"
     rtsp_last_buffer_key = rtsp_buffer_key + ':last'
     rtsp_last_timestamp_key = rtsp_timestamp_key + ':last'
 
-    if last_frag:
-        if first_frag:
-            print(f"[{TAG}:{message['nid']}:{sense_time}] empty image (fcnt:{fcnt})")
-        else:
-            image = (await r.get(image_buffer_key))[:reassembled_offset]
-
-            try:
-                image = Image.open(io.BytesIO(image))
-            except Exception as e:
-                print(f"[{TAG}:{message['nid']}:{sense_time}] open image error '{e}'", file=sys.stderr)
-                image = None
-
-            jpeg_completed = bytes()
-            if image is not None:
-                #Last reassembled
-                f = io.BytesIO()
-                image.save(f, 'JPEG')
-                jpeg_completed = f.getvalue()
-                message['data']['image'] = {
-                    'raw': jpeg_completed,
-                    'file_type': 'image',
-                    'file_ext': 'jpeg',
-                    'file_size': len(jpeg_completed),
-                }
-
-            await r.set(rtsp_buffer_key, jpeg_completed, timedelta(hours=24))
-            await r.set(rtsp_timestamp_key, sense_time, timedelta(hours=24))
-
-            if len(missing_blocks) == 0:
-                await r.set(rtsp_last_buffer_key, jpeg_completed, timedelta(hours=24))
-                await r.set(rtsp_last_timestamp_key, sense_time, timedelta(hours=24))
-                await r.copy(rtsp_last_buffer_key, rtsp_buffer_key, replace=True)
-
-                await r.delete(missing_blocks_key)
-                await r.delete(image_buffer_key)
-                print(f"[{TAG}:{message['nid']}:{sense_time}] image reassembly completed (fcnt:{fcnt}, size:{len(jpeg_completed)})")
-                await r.set(f"PP:EdgeEye:completed:{message['nid']}:{epoch}", 0, ex=timedelta(hours=24))
-                await pyiotown.post.async_command(iotown_url,
-                                                  iotown_token,
-                                                  message['nid'],
-                                                  epoch.to_bytes(5, byteorder='little', signed=False),
-                                                  lorawan={ 'f_port': 4, 'confirmed': False },
-                                                  group_id= message['grpid'],
-                                                  verify=False)
-            else:
-                message['data']['received'] = offset_next
-                message['data']['reassembled'] = reassembled_offset
-                message['data']['total_size'] = total_size
+    if first_frag and last_frag:
+        print(f"[{TAG}:{message['nid']}:{sense_time}] empty image (fcnt:{fcnt})")
     else:
-        jpeg_raw = (await r.get(image_buffer_key))[:reassembled_offset]
+        image = (await r.get(image_buffer_key))[:reassembled_offset]
 
         try:
-            image = Image.open(io.BytesIO(jpeg_raw))
+            image = Image.open(io.BytesIO(image))
         except Exception as e:
-            print(f"[{TAG}] open image error '{e}'", file=sys.stderr)
+            print(f"[{TAG}:{message['nid']}:{sense_time}] open image error '{e}'", file=sys.stderr)
             image = None
 
+        jpeg_reassembled = bytes()
         if image is not None:
-            #Being reassembled
             f = io.BytesIO()
             image.save(f, 'JPEG')
             jpeg_reassembled = f.getvalue()
@@ -777,22 +709,51 @@ async def async_post_process(message):
                 'file_ext': 'jpeg',
                 'file_size': len(jpeg_reassembled),
             }
-            
+
             await r.set(rtsp_buffer_key, jpeg_reassembled, timedelta(hours=24))
             await r.set(rtsp_timestamp_key, sense_time, timedelta(hours=24))
-        else:
-            message['data']['image'] = {
-                'raw': jpeg_raw,
-                'file_type': 'image',
-                'file_ext': 'jpeg',
-                'file_size': len(jpeg_raw),
-            }
 
+            if total_size == offset_next and len(missing_blocks) == 0:
+                await r.set(rtsp_last_buffer_key, jpeg_reassembled, timedelta(hours=24))
+                await r.set(rtsp_last_timestamp_key, sense_time, timedelta(hours=24))
+                await r.copy(rtsp_last_buffer_key, rtsp_buffer_key, replace=True)
+
+                await r.delete(missing_blocks_key)
+                await r.delete(image_buffer_key)
+                print(f"[{TAG}:{message['nid']}:{sense_time}] image reassembly completed (fcnt:{fcnt}, size:{len(jpeg_reassembled)})")
+                await r.set(f"PP:EdgeEye:completed:{message['nid']}:{epoch}", 0, ex=timedelta(hours=24))
+                await pyiotown.post.async_command(iotown_url,
+                                                  iotown_token,
+                                                  message['nid'],
+                                                  epoch.to_bytes(5, byteorder='little', signed=False),
+                                                  lorawan={ 'f_port': 4, 'confirmed': False },
+                                                  group_id= message['grpid'],
+                                                  verify=False)
         message['data']['received'] = offset_next
         message['data']['reassembled'] = reassembled_offset
         message['data']['total_size'] = total_size
 
+        start_time = datetime.strptime(sense_time, '%Y-%m-%dT%H:%M:%SZ')
+        end_time = datetime.now()
+        message['data']['sec_taken'] = end_time.timestamp() - start_time.timestamp()
+
+        if len(meta) > 1:
+            try:
+                fcnts = list(range(meta[0]['fCnt'], meta[-1]['fCnt'] + 1))
+            except Exception as e:
+                print(traceback.format_exc())
+                print(f"meta[0]:{meta[0]} ~ meta[-1]:{meta[-1]}")
+                raise e
+            fcnts_missing = fcnts.copy()
+            for m in meta:
+                try:
+                    fcnts_missing.remove(m['fCnt'])
+                except:
+                    pass
+                message['data']['prr'] = (len(fcnts) - len(fcnts_missing)) / len(fcnts) * 100
+
         await r.expire(image_buffer_key, timedelta(hours=1))
+
     await r.delete(mutex_key)
     
     if prev_data is not None:
