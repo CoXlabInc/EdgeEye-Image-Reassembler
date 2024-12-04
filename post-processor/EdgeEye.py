@@ -591,7 +591,11 @@ async def async_post_process(message):
         print(f"[{TAG}:{message['nid']}] pending block offset:{p_offset}, length:{len(p_raw)}")
 
         if p_epoch != epoch:
-            print("pending block sense_time mismatch")
+            print(f"[{TAG}:{message['nid']}] pending block sense_time mismatch")
+            continue
+
+        if p_offset >= total_size:
+            print(f"[{TAG}:{message['nid']}] too big offset (lesser than {total_size} expected but {p_offset}")
             continue
 
         pending_blocks.append((p_offset, p_raw))
@@ -603,7 +607,7 @@ async def async_post_process(message):
         offset, frag = p
         offset_end = offset + len(frag)
 
-        print(f"[{TAG}:{message['nid']}:{sense_time}] current(first:{first_frag}):{offset}~{offset_end}, max pos:{offset_next}, total size:{total_size}")
+        print(f"[{TAG}:{message['nid']}:{sense_time}] current(first:{first_frag}, last:{last_frag}):{offset}~{offset_end}, max pos:{offset_next}, total size:{total_size}")
 
         if offset > offset_next:
             print(f"[{TAG}:{message['nid']}:{sense_time}] {offset_next} expected but {offset}. add a missing block")
@@ -715,7 +719,7 @@ async def async_post_process(message):
             await r.set(rtsp_buffer_key, jpeg_reassembled, timedelta(hours=24))
             await r.set(rtsp_timestamp_key, sense_time, timedelta(hours=24))
 
-            if total_size == offset_next and len(missing_blocks) == 0:
+            if total_size <= offset_next and len(missing_blocks) == 0:
                 await r.set(rtsp_last_buffer_key, jpeg_reassembled, timedelta(hours=24))
                 await r.set(rtsp_last_timestamp_key, sense_time, timedelta(hours=24))
                 await r.copy(rtsp_last_buffer_key, rtsp_buffer_key, replace=True)
