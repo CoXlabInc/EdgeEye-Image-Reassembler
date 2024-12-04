@@ -690,7 +690,9 @@ async def async_post_process(message):
     if first_frag and last_frag:
         print(f"[{TAG}:{message['nid']}:{sense_time}] empty image (fcnt:{fcnt})")
     else:
-        image = (await r.get(image_buffer_key))[:reassembled_offset]
+        image = await r.get(image_buffer_key)
+        if image is not None:
+            image = (image)[:reassembled_offset]
 
         try:
             image = Image.open(io.BytesIO(image))
