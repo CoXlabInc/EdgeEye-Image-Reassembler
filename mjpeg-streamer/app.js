@@ -18,15 +18,11 @@ program
     .option('-v --version', 'show version')
     .parse(process.argv);
 
-const opts = program.opts();
+const redisUrl = program.opts().redis || process.env.REDIS_URL || 'redis://localhost';
+const port = program.opts().port || 8080;
+const boundaryID = "boundary_id";
 
-var port = opts.port || 8080,
-    boundaryID = "COXLABBOUNDARY";
-
-const redisUrl = opts.redis || 'redis://localhost';
-
-console.log(`Connecting Redis (${redisUrl})`);
-
+// Primary Redis client for data fetching
 var redisClient = redis.createClient({
     url: redisUrl
 });
@@ -40,168 +36,145 @@ try {
     process.exit(1);
 }
 
-async function sendAnImage(res, bufferKey, timestampKey, locale, timezone, height, mjpeg) {
-    if (res.writableEnded) {
-        return;
-    }
-    
-    let buffer = await redisClient.GET(redis.commandOptions({
-        returnBuffers: true
-    }), bufferKey);
-    
-    if (buffer.length > 0) {
-        let image;
-       
-        if (mjpeg) {
-            res.write('Content-Type: image/jpeg\r\n');
-        }
+async function fetchAndSendImage(res, bufferKey, timestampKey, locale, timezone, height, mjpeg) {
+    if (res.writableEnded) return;
 
+    let buffer = await redisClient.GET(redis.commandOptions({ returnBuffers: true }), bufferKey);
+    
+    if (!buffer || buffer.length === 0) {
+        // Fallback to last known good image
+        buffer = await redisClient.GET(redis.commandOptions({ returnBuffers: true }), bufferKey + ':last');
+    }
+
+    if (buffer && buffer.length > 0) {
         try {
-            image = sharp(buffer, { failOn: 'none' });
-        } catch(e) {
-            console.error(e);
-            buffer = await redisClient.GET(redis.commandOptions({
-                returnBuffers: true
-            }), bufferKey + ':last');
-
-            try {
-                image = sharp(buffer, { failOn: 'none' });
-            } catch(e) {
-                console.error(e);
+            let image = sharp(buffer, { failOn: 'none' });
+            const metadata = await image.metadata();
+            
+            let rawTimestamp = await redisClient.GET(timestampKey);
+            let timestampStr = "Unknown";
+            if (rawTimestamp) {
+                timestampStr = new Date(rawTimestamp).toLocaleString(locale, { timeZone: timezone });
             }
-        }
 
-        const metadata = await image.metadata();
-        let timestamp = new Date(await redisClient.GET(timestampKey));
-        timestamp = timestamp.toLocaleString(locale, { timeZone: timezone });
+            const processedBuffer = await image.composite([{
+                input: {
+                    text: {
+                        text: timestampStr,
+                        width: metadata.width,
+                        height: height,
+                        align: "left",
+                    }
+                },
+                top: 0,
+                left: 0
+            }]).jpeg().toBuffer();
 
-        buffer = await image.composite([{
-            input: {
-                text: {
-                    text: timestamp,
-                    width: metadata.width,
-                    height: height,
-                    align: "left",
-                }
-            },
-            top:0,
-            left:0
-        }]).jpeg().toBuffer();
-        
-        if(mjpeg) {
-            res.write(`Content-Length: ${buffer.length}\r\n\r\n`);
-            res.write(buffer, 'binary');
-            console.log(`Load and write data ${buffer.length}`);
-            res.write('\r\n--' + boundaryID + '\r\n');
-        } else {
-            res.end(buffer, 'binary');
+            if (mjpeg) {
+                res.write('Content-Type: image/jpeg\r\n');
+                res.write(`Content-Length: ${processedBuffer.length}\r\n\r\n`);
+                res.write(processedBuffer, 'binary');
+                res.write('\r\n--' + boundaryID + '\r\n');
+                console.log(`Sent frame: ${processedBuffer.length} bytes`);
+            } else {
+                res.writeHead(200, { 'Content-Type': 'image/jpeg' });
+                res.end(processedBuffer, 'binary');
+            }
+        } catch (e) {
+            console.error(`Image processing error: ${e.message}`);
         }
     }
-    if(mjpeg == true) {
-        setTimeout(sendAnImage, 1000, res, bufferKey, timestampKey, locale, timezone, height, mjpeg);
-    }
-};
+}
 
 /**
  * create a server to serve out the motion jpeg images
  */
 var server = http.createServer(async (req, res) => {
-    console.log(`Req URL: ${req.url}`);
-    // return a html page if the user accesses the server directly
-    if (req.url === "/") {
-        res.writeHead(200, { "content-type": "text/html;charset=utf-8" });
-        res.write('<!doctype html>');
-        res.write('<html>');
-        res.write('<head><title>' + pjson.name + '</title><meta charset="utf-8" /></head>');
-        res.write('<body>');
-        res.write('<img src="/LWAC1F09FFFE09112A/image" />');
-        res.write('</body>');
-        res.write('</html>');
-        res.end();
-        return;
-    }
-
-    if (req.url === "/healthcheck") {
-        res.statusCode = 200;
-        res.end();
-        return;
-    };
-
-    // for image requests, return a HTTP multipart document (stream)
     let uri = req.url.split('?');
     let path = uri[0].split('/').slice(1);
     let params = new URLSearchParams(uri[1]);
     
-    if (path.length <= 2) {
+    if (path.length >= 1 && path[0] !== 'healthcheck' && path[0] !== '') {
         const device = path[0];
+        const isLastRequest = path.length === 2 && path[1] === 'last';
         
         let bufferKey = `ImageToRtsp:${device}:image`;
         let timestampKey = `ImageToRtsp:${device}:sense_time`;
 
-        if (path.length == 2 && path[1] == 'last') {
+        if (isLastRequest) {
             bufferKey += ':last';
             timestampKey += ':last';
         }
-        
-        let bufferLength = await redisClient.STRLEN(bufferKey);
-        if (bufferLength == 0) {
-            res.statusCode = 404;
-            res.write('No image streaming found');
-            res.end();
-            return;
+
+        let mjpeg = params.get('mjpeg') !== 'false';
+        let locale = params.get('locale') || Intl.DateTimeFormat().resolvedOptions().locale;
+        let timezone = params.get('timezone') || Intl.DateTimeFormat().resolvedOptions().timeZone;
+        let height = parseInt(params.get('height')) || 30;
+
+        if (mjpeg) {
+            res.writeHead(200, {
+                'Content-Type': 'multipart/x-mixed-replace;boundary="' + boundaryID + '"',
+                'Connection': 'keep-alive',
+                'Cache-Control': 'no-cache, no-store, max-age=0, must-revalidate',
+                'Pragma': 'no-cache'
+            });
+            res.write('--' + boundaryID + '\r\n');
+
+            // Send initial frame
+            await fetchAndSendImage(res, bufferKey, timestampKey, locale, timezone, height, true);
+
+            // Setup Pub/Sub for live updates
+            const subscriber = redisClient.duplicate();
+            await subscriber.connect();
+            
+            const updateChannel = `EdgeEye:updated:${device}`;
+            let heartbeatTimer = null;
+
+            const sendHeartbeat = async () => {
+                if (res.writableEnded) return;
+                console.log(`Heartbeat for ${device}`);
+                await fetchAndSendImage(res, bufferKey, timestampKey, locale, timezone, height, true);
+                resetHeartbeat();
+            };
+
+            const resetHeartbeat = () => {
+                if (heartbeatTimer) clearTimeout(heartbeatTimer);
+                heartbeatTimer = setTimeout(sendHeartbeat, 10000); // 10s heartbeat
+            };
+
+            await subscriber.subscribe(updateChannel, async (message) => {
+                console.log(`Update notification received for ${device}`);
+                await fetchAndSendImage(res, bufferKey, timestampKey, locale, timezone, height, true);
+                resetHeartbeat();
+            });
+
+            resetHeartbeat();
+
+            res.on('close', async () => {
+                console.log(`Client disconnected for ${device}`);
+                if (heartbeatTimer) clearTimeout(heartbeatTimer);
+                await subscriber.unsubscribe(updateChannel);
+                await subscriber.disconnect();
+            });
+
         } else {
-            let mjpeg = params.get('mjpeg');
-            mjpeg = !(mjpeg == 'false');
-            if(mjpeg) {
-                res.writeHead(200, {
-                    'Content-Type': 'multipart/x-mixed-replace;boundary="' + boundaryID + '"',
-                    'Connection': 'keep-alive',
-                    'Expires': 'Fri, 27 May 1977 00:00:00 GMT',
-                    'Cache-Control': 'no-cache, no-store, max-age=0, must-revalidate',
-                    'Pragma': 'no-cache'
-                });
-                res.write('--' + boundaryID + '\r\n');
-            } else {
-                res.writeHead(200, {'Content-Type': 'image/jpeg'});
-            }
-            console.log('writing header');
-
-            let locale = params.get('locale');
-            if (locale == null) {
-                locale = Intl.DateTimeFormat().resolvedOptions().locale;
-            }
-            let timezone = params.get('timezone');
-            if (timezone == null) {
-                timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-            }
-            let height = parseInt(params.get('height'));
-            if (isNaN(height)) {
-                height = 30;
-            }
-            await sendAnImage(res, bufferKey, timestampKey, locale, timezone, height, mjpeg);
+            // Single image request
+            await fetchAndSendImage(res, bufferKey, timestampKey, locale, timezone, height, false);
         }
-
-        res.on('close', function() {
-            res.end();
-        });
+    } else if (req.url === "/healthcheck") {
+        res.statusCode = 200;
+        res.end();
     } else {
         res.statusCode = 404;
-        res.end();
-        return;
+        res.end('Not Found');
     }
 });
 
 server.on('error', function(e) {
-    if (e.code == 'EADDRINUSE') {
-        console.log('port already in use');
-    } else if (e.code == "EACCES") {
-        console.log("Illegal port");
-    } else {
-        console.log("Unknown error");
-    }
+    console.error(`Server error: ${e.message}`);
     process.exit(1);
 });
 
-// start the server
-server.listen(port);
-console.log(pjson.name + " started on port " + port);
+server.listen(port, () => {
+    console.log(`${pjson.name} started on port ${port}`);
+});

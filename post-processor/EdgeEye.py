@@ -230,11 +230,15 @@ class ImageReassembler:
             with io.BytesIO() as output:
                 img.save(output, format="JPEG")
                 jpeg_bytes = output.getvalue()
-            
+            # Update current image
             await r.set(f"{rtsp_base}:image", jpeg_bytes, ex=86400)
             await r.set(f"{rtsp_base}:sense_time", sense_time, ex=86400)
 
+            # Notify streamers that the image has been updated
+            await r.publish(f"EdgeEye:updated:{dev_eui}", "updated")
+
             if total_size and reassembled_len >= total_size:
+
                 print(f"[{dev_eui}] Reassembly complete! {len(jpeg_bytes)} bytes")
                 await r.set(f"{rtsp_base}:image:last", jpeg_bytes, ex=86400)
                 await r.set(f"{rtsp_base}:sense_time:last", sense_time, ex=86400)

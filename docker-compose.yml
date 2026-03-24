@@ -16,6 +16,9 @@ services:
       driver: "local"
     ports:
       - 8080:8080
+    environment:
+      - TZ=${TZ:-UTC}
+      - LANG=${LANG:-en_US.UTF-8}
     command: npm start -- -r ${REDIS_URL:-redis://redis}
 
   edgeeye_reassembler:
@@ -28,9 +31,8 @@ services:
     logging:
       driver: "local"
     environment:
-      - MQTT_URL=${MQTT_URL:-tcp://mosquitto:1883}
-      - REDIS_URL=${REDIS_URL:-redis://redis}
-      - DEVICE_PROFILE_ID=${DEVICE_PROFILE_ID}
+      - TZ=${TZ:-UTC}
+      - LANG=${LANG:-en_US.UTF-8}
     command:
       - python3
       - -u
