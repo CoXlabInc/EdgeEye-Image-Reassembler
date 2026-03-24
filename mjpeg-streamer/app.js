@@ -8,7 +8,7 @@ import { Command } from 'commander';
 const program = new Command();
 
 import redis from 'redis';
-import pjson from './package.json' assert { type: 'json' }
+import pjson from './package.json' with { type: 'json' }
 
 program
     .version(pjson.version)

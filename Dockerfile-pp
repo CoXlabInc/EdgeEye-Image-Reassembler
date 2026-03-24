@@ -6,8 +6,12 @@ RUN python3 -m pip install redis
 RUN python3 -m pip install pillow
 RUN python3 -m pip install numpy
 RUN python3 -m pip install pyjwt
-RUN python3 -m pip install pyiotown==0.6.4
+RUN python3 -m pip install paho-mqtt
 
 COPY ./post-processor .
 
-CMD [ "python3", "-u", "pp.py", "--url", "$IOTOWN_URL", "--user", "$IOTOWN_USER", "--token", "$IOTOWN_TOKEN", "--dry", "$DRY_RUN" ]
+# Default environment variables (can be overridden)
+ENV MQTT_URL="mqtt://localhost:1883"
+ENV REDIS_URL="redis://localhost:6379"
+
+CMD [ "python3", "-u", "pp.py", "--mqtt_url", "$MQTT_URL", "--redis_url", "$REDIS_URL" ]

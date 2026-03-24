@@ -1,33 +1,22 @@
 services:
-  iotown_mjpeg_streamer:
-    image: iotown_image_streamer
+  redis:
+    image: redis:alpine
+    restart: always
+    logging:
+      driver: "local"
+
+  mjpeg_streamer:
+    container_name: mjpeg_streamer
+    image: edgeeye_mjpeg_streamer
     build:
       context: .
       dockerfile: Dockerfile
     restart: always
     logging:
       driver: "local"
-    networks:
-      - iotown_default
     ports:
       - 8080:8080
     command: npm start -- -r ${REDIS_URL:-redis://redis}
-
-  mediamtx:
-    image: iotown_image_streamer
-    build:
-      context: .
-      dockerfile: Dockerfile
-    restart: always
-    logging:
-      driver: "local"
-    networks:
-      - iotown_default
-    volumes:
-      - ./config/mediamtx.yml:/root/mediamtx.yml
-    ports:
-      - 8554:8554
-      - 9997:9997
 
   edgeeye_pp:
     container_name: edgeeye_pp
@@ -37,25 +26,17 @@ services:
     restart: always
     logging:
       driver: "local"
-    networks:
-      - iotown_default
+    environment:
+      - MQTT_URL=${MQTT_URL:-tcp://mosquitto:1883}
+      - REDIS_URL=${REDIS_URL:-redis://redis}
+      - DEVICE_PROFILE_ID=${DEVICE_PROFILE_ID}
     command:
       - python3
       - -u
       - pp.py
-      - --url
-      - https://$IOTOWN_MESSAGE_PARSER_USER:$IOTOWN_MESSAGE_PARSER_TOKEN@iotown
       - --mqtt_url
-      - tcp://mosquitto:8883
+      - ${MQTT_URL:-tcp://mosquitto:1883}
       - --redis_url
       - ${REDIS_URL:-redis://redis}
-      - --chirpstack_url
-      - ${CHIRPSTACK_URL:-}
-      - --chirpstack_jwt_secret
-      - ${CHIRPSTACK_JWT_SECRET:-}
-      - --dry
-      - $IOTOWN_MESSAGE_PARSER_DRY_RUN
-
-networks:
-  iotown_default:
-    external: true
+      - --device_profile_id
+      - ${DEVICE_PROFILE_ID}

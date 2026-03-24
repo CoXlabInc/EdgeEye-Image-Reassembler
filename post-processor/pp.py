@@ -1,46 +1,36 @@
 import argparse
 from urllib.parse import urlparse
-
 import EdgeEye
-
-import pyiotown.post
-import pyiotown.post_process
-import pyiotown.get
-
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-url = None
-dry_run = False
+import sys
 
 if __name__ == '__main__':
-    app_desc = "EdgeEye Post Processor"
+    app_desc = "EdgeEye Post Processor (Chirpstack v4 MQTT)"
 
     parser = argparse.ArgumentParser(description=app_desc)
-    parser.add_argument("--url", help="IOTOWN URL", required=True)
-    parser.add_argument("--mqtt_url", help="MQTT broker URL for IoT.own", required=False, default=None)
+    parser.add_argument("--mqtt_url", help="Chirpstack MQTT broker URL", required=True)
+    parser.add_argument("--mqtt_user", help="MQTT username", required=False, default=None)
+    parser.add_argument("--mqtt_pass", help="MQTT password", required=False, default=None)
     parser.add_argument("--redis_url", help="Redis URL for context storage", required=True)
-    parser.add_argument("--chirpstack_url", help="Chirpstack Application Server URL for performance enhancement", required=False, default=None)
-    parser.add_argument("--chirpstack_jwt_secret", help="JWT secret for Chirpstack Application Server", required=False, default=None)
-    parser.add_argument('--dry', help=" Do not upload data to the server", type=int, default=0)
+    parser.add_argument("--device_profile_id", help="Filter by Device Profile ID", required=True)
     args = parser.parse_args()
 
     print(app_desc)
-    url = args.url.strip()
-    url_parsed = urlparse(url)
+    
+    if not args.device_profile_id:
+        print("Error: --device_profile_id is required. Use -h for help.")
+        sys.exit(1)
 
-    print(f"IOTOWN: {url_parsed.scheme}://{url_parsed.hostname}" + (f":{url_parsed.port}" if url_parsed.port is not None else ""))
-
-    mqtt_url = args.mqtt_url.strip() if args.mqtt_url is not None else None
-    chirpstack = {
-        'url': args.chirpstack_url.strip() if args.chirpstack_url is not None else None,
-        'secret': args.chirpstack_jwt_secret.strip() if args.chirpstack_jwt_secret is not None else None
+    mqtt_info = {
+        'url': args.mqtt_url.strip(),
+        'user': args.mqtt_user.strip() if args.mqtt_user else None,
+        'pass': args.mqtt_pass.strip() if args.mqtt_pass else None
     }
 
-    if args.dry == 1:
-        dry_run = True
-        print("DRY RUNNING!")
-
+    print(f"MQTT Broker: {mqtt_info['url']}")
+    print(f"Filtering by Device Profile ID: {args.device_profile_id}")
+    
     url_parsed = urlparse(args.redis_url)
     print(f"Redis: {url_parsed.scheme}://{url_parsed.hostname}" + (f":{url_parsed.port}" if url_parsed.port is not None else ""))
-    EdgeEye.init(url, 'EdgeEye', mqtt_url, args.redis_url.strip(), chirpstack=chirpstack, dry_run=dry_run).loop_forever()
+    
+    # Initialize EdgeEye and start the loop
+    EdgeEye.init(mqtt_info, args.redis_url.strip(), args.device_profile_id.strip()).loop_forever()
