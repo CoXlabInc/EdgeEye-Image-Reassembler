@@ -10,7 +10,7 @@ services:
     image: edgeeye_mjpeg_streamer
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile-streamer
     restart: always
     logging:
       driver: "local"
@@ -18,11 +18,12 @@ services:
       - 8080:8080
     command: npm start -- -r ${REDIS_URL:-redis://redis}
 
-  edgeeye_pp:
-    container_name: edgeeye_pp
+  edgeeye_reassembler:
+    container_name: edgeeye_reassembler
+    image: edgeeye_reassembler
     build:
       context: .
-      dockerfile: Dockerfile-pp
+      dockerfile: Dockerfile-reassembler
     restart: always
     logging:
       driver: "local"
@@ -33,7 +34,7 @@ services:
     command:
       - python3
       - -u
-      - pp.py
+      - EdgeEye.py
       - --mqtt_url
       - ${MQTT_URL:-tcp://mosquitto:1883}
       - --redis_url

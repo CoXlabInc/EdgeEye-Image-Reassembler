@@ -13,5 +13,6 @@ COPY ./post-processor .
 # Default environment variables (can be overridden)
 ENV MQTT_URL="mqtt://localhost:1883"
 ENV REDIS_URL="redis://localhost:6379"
+ENV DEVICE_PROFILE_ID=""
 
-CMD [ "python3", "-u", "pp.py", "--mqtt_url", "$MQTT_URL", "--redis_url", "$REDIS_URL" ]
+CMD [ "python3", "-u", "EdgeEye.py", "--mqtt_url", "$MQTT_URL", "--redis_url", "$REDIS_URL", "--device_profile_id", "$DEVICE_PROFILE_ID" ]

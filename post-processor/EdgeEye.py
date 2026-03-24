@@ -1,295 +1,271 @@
 import base64
-from datetime import datetime, timedelta
-import time
 import json
-import redis.asyncio as redis
-from urllib.parse import urlparse
 import io
-from PIL import ImageFile
-from PIL import Image
 import sys
 import asyncio
 import threading
-import paho.mqtt.client as mqtt
 import traceback
+import argparse
+from datetime import datetime, timezone
+from urllib.parse import urlparse
 
-TAG = 'EdgeEye'
+import redis.asyncio as redis
+import paho.mqtt.client as mqtt
+from PIL import Image, ImageFile
+
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-# Global variables
-pool = None
-event_loop = None
-mqtt_client = None
-filter_device_profile_id = None
-
-def init(mqtt_info, redis_url, device_profile_id):
-    global pool, event_loop, mqtt_client, filter_device_profile_id
-
-    if redis_url is None:
-        print(f"Redis is required for EdgeEye.")
-        return None
-    
-    filter_device_profile_id = device_profile_id
-
-    pool = redis.ConnectionPool.from_url(redis_url)
-
-    event_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(event_loop)
-
-    def event_loop_thread():
-        event_loop.run_forever()
-    threading.Thread(target=event_loop_thread, daemon=True).start()
-
-    # Setup MQTT client
-    url_parsed = urlparse(mqtt_info['url'])
-    host = url_parsed.hostname
-    port = url_parsed.port if url_parsed.port else 1883
-    
-    mqtt_client = mqtt.Client()
-    if mqtt_info['user'] and mqtt_info['pass']:
-        mqtt_client.username_pw_set(mqtt_info['user'], mqtt_info['pass'])
-    
-    mqtt_client.on_connect = on_mqtt_connect
-    mqtt_client.on_message = on_mqtt_message
-    
-    print(f"Connecting to MQTT Broker: {host}:{port}...")
-    mqtt_client.connect(host, port, 60)
-
-    return mqtt_client
-
-def on_mqtt_connect(client, userdata, flags, rc):
-    print(f"Connected to MQTT Broker with result code {rc}")
-    # Subscribe to Chirpstack v4 Uplink events
-    client.subscribe("application/+/device/+/event/up")
-
-def on_mqtt_message(client, userdata, msg):
-    try:
-        data = json.loads(msg.payload)
+class ImageReassembler:
+    def __init__(self, mqtt_info, redis_url, device_profile_id):
+        self.mqtt_info = mqtt_info
+        self.redis_url = redis_url
+        self.device_profile_id = device_profile_id
         
-        # Filter by Device Profile ID
-        device_profile_id = data.get('deviceInfo', {}).get('deviceProfileId')
-        if device_profile_id != filter_device_profile_id:
-            # Silently ignore packets from other device profiles
-            return
-
-        # Extract necessary fields from Chirpstack v4 JSON
-        dev_eui = data.get('deviceInfo', {}).get('devEui')
-        f_port = data.get('fPort')
-        f_cnt = data.get('fCnt')
-        raw_b64 = data.get('data')
+        self.pool = None
+        self.event_loop = None
+        self.mqtt_client = None
+        self.device_locks = {} # Per-device locks to ensure sequential processing
         
-        if raw_b64 is None:
-            return
+    def start(self):
+        """Initialize and start the processor"""
+        if not self.redis_url:
+            print("Redis URL is required.")
+            return None
 
-        # Map to the format expected by async_post_process
-        message = {
-            'nid': dev_eui,
-            'grpid': data.get('deviceInfo', {}).get('applicationId', 'default'),
-            'key': dev_eui,
-            'meta': {
-                'fPort': f_port,
-                'fCnt': f_cnt,
-                'raw': raw_b64
-            },
-            'data': {} # Placeholder for processed data
+        self.pool = redis.ConnectionPool.from_url(self.redis_url)
+
+        self.event_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.event_loop)
+        
+        def run_loop():
+            self.event_loop.run_forever()
+        threading.Thread(target=run_loop, daemon=True).start()
+
+        url_parsed = urlparse(self.mqtt_info['url'])
+        host = url_parsed.hostname
+        port = url_parsed.port or 1883
+        
+        self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        if self.mqtt_info.get('user') and self.mqtt_info.get('pass'):
+            self.mqtt_client.username_pw_set(self.mqtt_info['user'], self.mqtt_info['pass'])
+            
+        self.mqtt_client.on_connect = self._on_mqtt_connect
+        self.mqtt_client.on_message = self._on_mqtt_message
+        
+        print(f"Connecting to MQTT Broker: {host}:{port}...")
+        self.mqtt_client.connect(host, port, 60)
+        return self.mqtt_client
+
+    def loop_forever(self):
+        if self.mqtt_client:
+            self.mqtt_client.loop_forever()
+
+    def _on_mqtt_connect(self, client, userdata, flags, reason_code, properties):
+        print(f"Connected to MQTT Broker (Reason Code: {reason_code})")
+        client.subscribe("application/+/device/+/event/up")
+
+    def _on_mqtt_message(self, client, userdata, msg):
+        try:
+            data = json.loads(msg.payload)
+            device_info = data.get('deviceInfo', {})
+            
+            if device_info.get('deviceProfileId') != self.device_profile_id:
+                return
+
+            dev_eui = device_info.get('devEui')
+            f_port = data.get('fPort')
+            raw_b64 = data.get('data')
+            
+            if not raw_b64:
+                return
+
+            message = {
+                'dev_eui': dev_eui,
+                'app_id': device_info.get('applicationId', 'default'),
+                'f_port': f_port,
+                'f_cnt': data.get('fCnt'),
+                'raw': base64.b64decode(raw_b64)
+            }
+            
+            asyncio.run_coroutine_threadsafe(self._process_uplink(message), self.event_loop)
+            
+        except Exception as e:
+            print(f"Error handling MQTT message: {e}")
+
+    async def _send_downlink(self, app_id, dev_eui, f_port, payload, confirmed=False):
+        topic = f"application/{app_id}/device/{dev_eui}/command/down"
+        downlink = {
+            "devEui": dev_eui,
+            "confirmed": confirmed,
+            "fPort": f_port,
+            "data": base64.b64encode(payload).decode('utf-8')
         }
+        self.mqtt_client.publish(topic, json.dumps(downlink))
+        print(f"[{dev_eui}] Downlink sent (FPort {f_port}): {payload.hex()}")
+
+    async def _process_uplink(self, msg):
+        dev_eui = msg['dev_eui']
         
-        # Execute post process in the event loop
-        asyncio.run_coroutine_threadsafe(async_post_process(message), event_loop)
+        # Get or create a lock for this specific device to handle packets sequentially
+        if dev_eui not in self.device_locks:
+            self.device_locks[dev_eui] = asyncio.Lock()
         
-    except Exception as e:
-        print(f"Error processing MQTT message: {e}")
-        traceback.print_exc()
-
-async def send_downlink(application_id, dev_eui, f_port, payload_bytes, confirmed=False):
-    """Sends a downlink message via Chirpstack v4 MQTT"""
-    topic = f"application/{application_id}/device/{dev_eui}/command/down"
-    
-    downlink_data = {
-        "devEui": dev_eui,
-        "confirmed": confirmed,
-        "fPort": f_port,
-        "data": base64.b64encode(payload_bytes).decode('utf-8')
-    }
-    
-    mqtt_client.publish(topic, json.dumps(downlink_data))
-    print(f"[{TAG}:{dev_eui}] Downlink sent to FPort {f_port}: {payload_bytes.hex()}")
-
-async def async_post_process(message):
-    r = redis.Redis(connection_pool=pool)
-    
-    # MUTEX
-    mutex_key = f"PP:EdgeEye:MUTEX:{message['nid']}"
-    lock = await r.set(mutex_key, 'lock', ex=30, nx=True)
-    if lock != True:
-        await r.aclose()
-        return None
-
-    message['data']['image'] = None
-    message['data']['error'] = ''
-    message['data']['meta_total'] = []
-    
-    fport = message['meta'].get('fPort')
-    raw = base64.b64decode(message['meta']['raw'])
-    dev_eui = message['nid']
-    app_id = message['grpid']
-
-    if fport == 2:
-        # Fail Report logic remains the same
-        if raw[0] == 0:
-            message['data']['error'] = "Camera boot failed"
-        elif raw[0] == 1:
-            message['data']['error'] = "Camera snap failed"
-        elif raw[0] == 2:
-            message['data']['error'] = "Send failed"
-        else:
-            message['data']['error'] = f"Unknown fail ({raw[0]})"
-        print(f"[{TAG}:{dev_eui}] Error: {message['data']['error']}")
-        await r.delete(mutex_key)
-        await r.aclose()
-        return message
-    elif fport != 1:
-        # Ignore other ports
-        await r.delete(mutex_key)
-        await r.aclose()
-        return None
-    
-    fcnt = message['meta'].get('fCnt')
-    flags = raw[0]
-    epoch = int.from_bytes(raw[1:6], 'little', signed=False)
-    offset = int.from_bytes(raw[6:9], 'little', signed=False)
-
-    i = 9
-    if (flags & (1 << 2)) != 0: i += 2 # sysv
-    if (flags & (1 << 3)) != 0: i += 3 # als
- 
-    first_frag = ((flags & (1 << 0)) != 0)
-    last_frag = ((flags & (1 << 1)) != 0)
-
-    frag = raw[i:]
-    sense_time = datetime.utcfromtimestamp(epoch).isoformat() + 'Z'
-
-    missing_blocks_key = f"PP:EdgeEye:missing:{dev_eui}:{epoch}"
-    image_buffer_key = f"PP:EdgeEye:buffer:{dev_eui}:{epoch}"
-    state_key = f"PP:EdgeEye:state:{dev_eui}:{epoch}"
-
-    # Check if already completed
-    if await r.get(f"PP:EdgeEye:completed:{dev_eui}:{epoch}") is not None:
-        await send_downlink(app_id, dev_eui, 4, epoch.to_bytes(5, byteorder='little', signed=False))
-        await r.delete(mutex_key)
-        await r.aclose()
-        return None
-
-    # Load reassembly state from Redis
-    state = await r.get(state_key)
-    if state:
-        state = json.loads(state)
-        offset_next = state.get('received', 0)
-        total_size = state.get('total_size')
-        meta = state.get('meta_total', [])
-    else:
-        offset_next = 0
-        total_size = None
-        meta = []
-
-    if first_frag:
-        total_size = offset
-        offset = 0
-    elif total_size is None:
-        # Missing first fragment - Request it
-        print(f"[{TAG}:{dev_eui}:{sense_time}] Missing the first fragment")
-        frag_req = raw[1:6] + b'\x00\x00\x00'
-        await send_downlink(app_id, dev_eui, 4, frag_req)
-        await r.delete(mutex_key)
-        await r.aclose()
-        return None
-
-    # Handle missing blocks tracking
-    missing_blocks_raw = await r.get(missing_blocks_key)
-    try:
-        missing_blocks = json.loads(missing_blocks_raw) if missing_blocks_raw else []
-    except:
-        missing_blocks = []
-
-    offset_end = offset + len(frag)
-    print(f"[{TAG}:{dev_eui}:{sense_time}] Frag:{offset}~{offset_end}, Next:{offset_next}, Total:{total_size}")
-
-    if offset > offset_next:
-        if [offset_next, offset] not in missing_blocks:
-            missing_blocks.append([offset_next, offset])
-    elif offset < offset_next:
-        # Shrink/remove existing missing blocks
-        updated_missing_blocks = []
-        for b in missing_blocks:
-            if offset <= b[0] and offset_end >= b[1]: continue
-            elif offset <= b[0] and b[0] < offset_end < b[1]: b[0] = offset_end
-            elif b[0] < offset < b[1] <= offset_end: b[1] = offset
-            elif b[0] < offset and offset_end < b[1]:
-                updated_missing_blocks.append([offset_end, b[1]])
-                b[1] = offset
-            updated_missing_blocks.append(b)
-        missing_blocks = updated_missing_blocks
-
-    # Write to Redis buffer
-    offset_next = int(await r.setrange(image_buffer_key, offset, frag))
-    reassembled_offset = offset_next
-    
-    if len(missing_blocks) > 0:
-        for b in missing_blocks:
-            if b[0] < reassembled_offset: reassembled_offset = b[0]
-        await r.set(missing_blocks_key, json.dumps(missing_blocks), ex=86400)
-        
-        # Request missing fragment
-        missing_min = min(missing_blocks, key=lambda x: x[0])
-        print(f"[{TAG}:{dev_eui}:{sense_time}] Packet loss detected. Missing: {missing_min[0]}~{missing_min[1]}")
-        frag_req = raw[1:6] + (missing_min[0]).to_bytes(3, 'little') + (missing_min[1]).to_bytes(3, 'little')
-        await send_downlink(app_id, dev_eui, 4, frag_req)
-    else:
-        await r.delete(missing_blocks_key)
-
-    # Update metadata
-    meta.append({'fCnt': fcnt, 'time': datetime.now().isoformat()})
-    
-    # Save reassembly state back to Redis
-    new_state = {
-        'received': offset_next,
-        'total_size': total_size,
-        'meta_total': meta
-    }
-    await r.set(state_key, json.dumps(new_state), ex=3600)
-
-    # Image conversion logic
-    rtsp_buffer_key = f"ImageToRtsp:{dev_eui}:image"
-    rtsp_timestamp_key = f"ImageToRtsp:{dev_eui}:sense_time"
-
-    if not (first_frag and last_frag):
-        image_data = await r.get(image_buffer_key)
-        if image_data:
-            image_data = image_data[:reassembled_offset]
+        async with self.device_locks[dev_eui]:
             try:
-                img = Image.open(io.BytesIO(image_data))
-                f = io.BytesIO()
-                img.save(f, 'JPEG')
-                jpeg_reassembled = f.getvalue()
+                r = redis.Redis(connection_pool=self.pool)
+                if msg['f_port'] == 2:
+                    self._handle_fail_report(dev_eui, msg['raw'])
+                elif msg['f_port'] == 1:
+                    await self._handle_image_fragment(r, msg)
+                await r.aclose()
+            except Exception:
+                traceback.print_exc()
+
+    def _handle_fail_report(self, dev_eui, raw):
+        errors = {0: "Camera boot failed", 1: "Camera snap failed", 2: "Send failed"}
+        error_msg = errors.get(raw[0], f"Unknown fail ({raw[0]})")
+        print(f"[{dev_eui}] Device Error: {error_msg}")
+
+    async def _handle_image_fragment(self, r, msg):
+        dev_eui = msg['dev_eui']
+        app_id = msg['app_id']
+        raw = msg['raw']
+        
+        flags = raw[0]
+        epoch = int.from_bytes(raw[1:6], 'little')
+        offset = int.from_bytes(raw[6:9], 'little')
+        
+        header_size = 9
+        if (flags & (1 << 2)): header_size += 2
+        if (flags & (1 << 3)): header_size += 3
+        
+        first_frag = bool(flags & (1 << 0))
+        last_frag = bool(flags & (1 << 1))
+        frag_data = raw[header_size:]
+        sense_time = datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat().replace('+00:00', 'Z')
+
+        prefix = f"PP:EdgeEye"
+        completed_key = f"{prefix}:completed:{dev_eui}:{epoch}"
+        buffer_key = f"{prefix}:buffer:{dev_eui}:{epoch}"
+        state_key = f"{prefix}:state:{dev_eui}:{epoch}"
+        missing_key = f"{prefix}:missing:{dev_eui}:{epoch}"
+
+        if await r.exists(completed_key):
+            await self._send_downlink(app_id, dev_eui, 4, epoch.to_bytes(5, 'little'))
+            return
+
+        state = await r.get(state_key)
+        if state:
+            state = json.loads(state)
+            if 'meta' not in state: state['meta'] = []
+        else:
+            state = {'received': 0, 'total_size': None, 'meta': []}
+        
+        if first_frag:
+            state['total_size'] = offset
+            offset = 0
+        elif state['total_size'] is None:
+            print(f"[{dev_eui}:{sense_time}] Missing first fragment (fCnt:{msg['f_cnt']}). Requesting...")
+            await self._send_downlink(app_id, dev_eui, 4, raw[1:6] + b'\x00\x00\x00')
+            return
+
+        missing_raw = await r.get(missing_key)
+        missing_blocks = json.loads(missing_raw) if missing_raw else []
+        
+        new_offset_next = await self._apply_fragment(r, buffer_key, offset, frag_data, state['received'], missing_blocks)
+        
+        reassembled_offset = new_offset_next
+        if missing_blocks:
+            reassembled_offset = min(b[0] for b in missing_blocks)
+            await r.set(missing_key, json.dumps(missing_blocks), ex=86400)
+            
+            m = min(missing_blocks, key=lambda x: x[0])
+            print(f"[{dev_eui}:{sense_time}] Packet loss! Missing: {m[0]}~{m[1]} (fCnt:{msg['f_cnt']})")
+            req = raw[1:6] + m[0].to_bytes(3, 'little') + m[1].to_bytes(3, 'little')
+            await self._send_downlink(app_id, dev_eui, 4, req)
+        else:
+            await r.delete(missing_key)
+
+        state['received'] = new_offset_next
+        state['meta'].append({'fCnt': msg['f_cnt'], 'ts': datetime.now(timezone.utc).isoformat()})
+        await r.set(state_key, json.dumps(state), ex=3600)
+
+        total = state['total_size']
+        percent = (reassembled_offset / total * 100) if total > 0 else 0
+        print(f"[{dev_eui}:{sense_time}] Progress: {reassembled_offset}/{total} ({percent:.2f}%) +{len(frag_data)}B (fCnt:{msg['f_cnt']})")
+
+        await self._finalize_image(r, dev_eui, app_id, epoch, sense_time, buffer_key, 
+                                   reassembled_offset, total, last_frag, completed_key, state_key)
+
+    async def _apply_fragment(self, r, key, offset, data, received, missing_blocks):
+        offset_end = offset + len(data)
+        
+        if offset > received:
+            if [received, offset] not in missing_blocks:
+                missing_blocks.append([received, offset])
+        elif offset < received:
+            new_missing = []
+            for b in missing_blocks:
+                if offset <= b[0] and offset_end >= b[1]: continue
+                if offset <= b[0] and b[0] < offset_end < b[1]: b[0] = offset_end
+                elif b[0] < offset < b[1] <= offset_end: b[1] = offset
+                elif b[0] < offset and offset_end < b[1]:
+                    new_missing.append([offset_end, b[1]])
+                    b[1] = offset
+                new_missing.append(b)
+            missing_blocks[:] = new_missing
+
+        return int(await r.setrange(key, offset, data))
+
+    async def _finalize_image(self, r, dev_eui, app_id, epoch, sense_time, buffer_key, 
+                              reassembled_len, total_size, is_last, completed_key, state_key):
+        rtsp_base = f"ImageToRtsp:{dev_eui}"
+        
+        img_data = await r.get(buffer_key)
+        if not img_data: return
+        
+        img_data = img_data[:reassembled_len]
+        try:
+            img = Image.open(io.BytesIO(img_data))
+            with io.BytesIO() as output:
+                img.save(output, format="JPEG")
+                jpeg_bytes = output.getvalue()
+            
+            await r.set(f"{rtsp_base}:image", jpeg_bytes, ex=86400)
+            await r.set(f"{rtsp_base}:sense_time", sense_time, ex=86400)
+
+            if total_size and reassembled_len >= total_size:
+                print(f"[{dev_eui}] Reassembly complete! {len(jpeg_bytes)} bytes")
+                await r.set(f"{rtsp_base}:image:last", jpeg_bytes, ex=86400)
+                await r.set(f"{rtsp_base}:sense_time:last", sense_time, ex=86400)
+                await r.set(completed_key, 1, ex=86400)
+                await self._send_downlink(app_id, dev_eui, 4, epoch.to_bytes(5, 'little'))
+                await r.delete(buffer_key)
+                await r.delete(state_key)
                 
-                await r.set(rtsp_buffer_key, jpeg_reassembled, ex=86400)
-                await r.set(rtsp_timestamp_key, sense_time, ex=86400)
+        except Exception as e:
+            if is_last:
+                print(f"[{dev_eui}] Final image error: {e}")
 
-                if total_size <= offset_next and len(missing_blocks) == 0:
-                    print(f"[{TAG}:{dev_eui}:{sense_time}] Image reassembly completed. Size:{len(jpeg_reassembled)}")
-                    
-                    # Store as the last completed image
-                    await r.set(rtsp_buffer_key + ":last", jpeg_reassembled, ex=86400)
-                    await r.set(rtsp_timestamp_key + ":last", sense_time, ex=86400)
-                    
-                    await r.set(f"PP:EdgeEye:completed:{dev_eui}:{epoch}", 1, ex=86400)
-                    await send_downlink(app_id, dev_eui, 4, epoch.to_bytes(5, 'little'))
-                    await r.delete(image_buffer_key)
-                    await r.delete(state_key)
-            except Exception as e:
-                if last_frag:
-                    print(f"[{TAG}:{dev_eui}:{sense_time}] Final image process error: {e}")
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="EdgeEye Image Reassembler (Chirpstack v4 MQTT)")
+    parser.add_argument("--mqtt_url", help="Chirpstack MQTT broker URL", required=True)
+    parser.add_argument("--mqtt_user", help="MQTT username", required=False, default=None)
+    parser.add_argument("--mqtt_pass", help="MQTT password", required=False, default=None)
+    parser.add_argument("--redis_url", help="Redis URL for context storage", required=True)
+    parser.add_argument("--device_profile_id", help="Filter by Device Profile ID", required=True)
+    args = parser.parse_args()
 
-    await r.delete(mutex_key)
-    await r.aclose()
-    return message
+    mqtt_info = {
+        'url': args.mqtt_url.strip(),
+        'user': args.mqtt_user.strip() if args.mqtt_user else None,
+        'pass': args.mqtt_pass.strip() if args.mqtt_pass else None
+    }
+
+    print(f"EdgeEye Reassembler starting...")
+    print(f"MQTT Broker: {mqtt_info['url']}")
+    print(f"Filtering by Device Profile ID: {args.device_profile_id}")
+    
+    processor = ImageReassembler(mqtt_info, args.redis_url.strip(), args.device_profile_id.strip())
+    processor.start()
+    processor.loop_forever()
