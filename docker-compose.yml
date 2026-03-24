@@ -43,3 +43,7 @@ services:
       - ${REDIS_URL:-redis://redis}
       - --device_profile_id
       - ${DEVICE_PROFILE_ID}
+      - --upload_url
+      - ${UPLOAD_URL:-}
+      - --upload_headers
+      - ${UPLOAD_HEADERS:-}

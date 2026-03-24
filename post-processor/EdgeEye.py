@@ -6,6 +6,7 @@ import asyncio
 import threading
 import traceback
 import argparse
+import aiohttp
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -16,10 +17,12 @@ from PIL import Image, ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 class ImageReassembler:
-    def __init__(self, mqtt_info, redis_url, device_profile_id):
+    def __init__(self, mqtt_info, redis_url, device_profile_id, upload_url=None, upload_headers=None):
         self.mqtt_info = mqtt_info
         self.redis_url = redis_url
         self.device_profile_id = device_profile_id
+        self.upload_url = upload_url
+        self.upload_headers = upload_headers if upload_headers else {}
         
         self.pool = None
         self.event_loop = None
@@ -131,58 +134,87 @@ class ImageReassembler:
         app_id = msg['app_id']
         raw = msg['raw']
         
+        if len(raw) < 9:
+            return
+
         flags = raw[0]
         epoch = int.from_bytes(raw[1:6], 'little')
         offset = int.from_bytes(raw[6:9], 'little')
         
-        header_size = 9
-        if (flags & (1 << 2)): header_size += 2
-        if (flags & (1 << 3)): header_size += 3
+        i = 9
+        sysv = None
+        if (flags & (1 << 2)):
+            sysv = int.from_bytes(raw[i:i+2], 'little') / 1000.0
+            i += 2
+        
+        als = None
+        if (flags & (1 << 3)):
+            als = int.from_bytes(raw[i:i+3], 'little')
+            i += 3
         
         first_frag = bool(flags & (1 << 0))
         last_frag = bool(flags & (1 << 1))
-        frag_data = raw[header_size:]
+        frag_data = raw[i:]
         sense_time = datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat().replace('+00:00', 'Z')
 
         prefix = f"PP:EdgeEye"
+        active_epoch_key = f"{prefix}:active_epoch:{dev_eui}"
         completed_key = f"{prefix}:completed:{dev_eui}:{epoch}"
         buffer_key = f"{prefix}:buffer:{dev_eui}:{epoch}"
         state_key = f"{prefix}:state:{dev_eui}:{epoch}"
         missing_key = f"{prefix}:missing:{dev_eui}:{epoch}"
+        last_dl_key = f"{prefix}:last_dl:{dev_eui}:{epoch}"
 
         if await r.exists(completed_key):
-            await self._send_downlink(app_id, dev_eui, 4, epoch.to_bytes(5, 'little'))
+            if len(frag_data) > 0 and not await r.exists(last_dl_key):
+                await self._send_downlink(app_id, dev_eui, 4, epoch.to_bytes(5, 'little'))
+                await r.set(last_dl_key, 1, ex=10)
+            return
+
+        active_epoch = await r.get(active_epoch_key)
+        active_epoch = int(active_epoch) if active_epoch else 0
+        if epoch < active_epoch:
+            return
+        elif epoch > active_epoch:
+            print(f"[{dev_eui}] New image detected: 0x{epoch:08X} (replacing 0x{active_epoch:08X})")
+            await r.set(active_epoch_key, epoch, ex=86400)
+
+        if len(frag_data) == 0 and not first_frag:
             return
 
         state = await r.get(state_key)
-        if state:
-            state = json.loads(state)
-            if 'meta' not in state: state['meta'] = []
-        else:
-            state = {'received': 0, 'total_size': None, 'meta': []}
+        state = json.loads(state) if state else {'received': 0, 'total_size': None, 'meta': []}
+        if 'meta' not in state: state['meta'] = []
+        
+        if sysv is not None: state['system_voltage'] = sysv
+        if als is not None: state['ambient_light_lux'] = als
         
         if first_frag:
             state['total_size'] = offset
             offset = 0
         elif state['total_size'] is None:
-            print(f"[{dev_eui}:{sense_time}] Missing first fragment (fCnt:{msg['f_cnt']}). Requesting...")
-            await self._send_downlink(app_id, dev_eui, 4, raw[1:6] + b'\x00\x00\x00')
+            if not await r.exists(last_dl_key):
+                print(f"[{dev_eui}:{sense_time}] Missing first fragment (Epoch: 0x{epoch:08X}). Requesting...")
+                await self._send_downlink(app_id, dev_eui, 4, raw[1:6] + b'\x00\x00\x00')
+                await r.set(last_dl_key, 1, ex=10)
             return
 
         missing_raw = await r.get(missing_key)
         missing_blocks = json.loads(missing_raw) if missing_raw else []
         
         new_offset_next = await self._apply_fragment(r, buffer_key, offset, frag_data, state['received'], missing_blocks)
-        
         reassembled_offset = new_offset_next
         if missing_blocks:
             reassembled_offset = min(b[0] for b in missing_blocks)
             await r.set(missing_key, json.dumps(missing_blocks), ex=86400)
-            
-            m = min(missing_blocks, key=lambda x: x[0])
-            print(f"[{dev_eui}:{sense_time}] Packet loss! Missing: {m[0]}~{m[1]} (fCnt:{msg['f_cnt']})")
-            req = raw[1:6] + m[0].to_bytes(3, 'little') + m[1].to_bytes(3, 'little')
-            await self._send_downlink(app_id, dev_eui, 4, req)
+
+            # Send gap request only if we received meaningful data in this packet
+            if len(frag_data) > 0 and not await r.exists(last_dl_key):
+                m = min(missing_blocks, key=lambda x: x[0])
+                print(f"[{dev_eui}:{sense_time}] Packet loss! Missing: {m[0]}~{m[1]} (Epoch: 0x{epoch:08X})")
+                req = raw[1:6] + m[0].to_bytes(3, 'little') + m[1].to_bytes(3, 'little')
+                await self._send_downlink(app_id, dev_eui, 4, req)
+                await r.set(last_dl_key, 1, ex=60)
         else:
             await r.delete(missing_key)
 
@@ -194,12 +226,15 @@ class ImageReassembler:
         percent = (reassembled_offset / total * 100) if total > 0 else 0
         print(f"[{dev_eui}:{sense_time}] Progress: {reassembled_offset}/{total} ({percent:.2f}%) +{len(frag_data)}B (fCnt:{msg['f_cnt']})")
 
-        await self._finalize_image(r, dev_eui, app_id, epoch, sense_time, buffer_key, 
-                                   reassembled_offset, total, last_frag, completed_key, state_key)
+        if len(frag_data) > 0:
+            await self._finalize_image(r, dev_eui, app_id, epoch, sense_time, buffer_key, 
+                                       reassembled_offset, total, last_frag, completed_key, state_key, state)
 
     async def _apply_fragment(self, r, key, offset, data, received, missing_blocks):
+        if len(data) == 0:
+            return received
+
         offset_end = offset + len(data)
-        
         if offset > received:
             if [received, offset] not in missing_blocks:
                 missing_blocks.append([received, offset])
@@ -218,7 +253,7 @@ class ImageReassembler:
         return int(await r.setrange(key, offset, data))
 
     async def _finalize_image(self, r, dev_eui, app_id, epoch, sense_time, buffer_key, 
-                              reassembled_len, total_size, is_last, completed_key, state_key):
+                              reassembled_len, total_size, is_last, completed_key, state_key, state):
         rtsp_base = f"ImageToRtsp:{dev_eui}"
         
         img_data = await r.get(buffer_key)
@@ -230,15 +265,14 @@ class ImageReassembler:
             with io.BytesIO() as output:
                 img.save(output, format="JPEG")
                 jpeg_bytes = output.getvalue()
-            # Update current image
+            
             await r.set(f"{rtsp_base}:image", jpeg_bytes, ex=86400)
             await r.set(f"{rtsp_base}:sense_time", sense_time, ex=86400)
-
-            # Notify streamers that the image has been updated
+            
+            # Notify streamers
             await r.publish(f"EdgeEye:updated:{dev_eui}", "updated")
 
             if total_size and reassembled_len >= total_size:
-
                 print(f"[{dev_eui}] Reassembly complete! {len(jpeg_bytes)} bytes")
                 await r.set(f"{rtsp_base}:image:last", jpeg_bytes, ex=86400)
                 await r.set(f"{rtsp_base}:sense_time:last", sense_time, ex=86400)
@@ -247,9 +281,43 @@ class ImageReassembler:
                 await r.delete(buffer_key)
                 await r.delete(state_key)
                 
+                # Perform HTTP upload if configured
+                if self.upload_url:
+                    data_extra = {}
+                    if 'system_voltage' in state: data_extra['system_voltage'] = state['system_voltage']
+                    if 'ambient_light_lux' in state: data_extra['ambient_light_lux'] = state['ambient_light_lux']
+                    asyncio.create_task(self._upload_image(dev_eui, jpeg_bytes, sense_time, data_extra))
+                
         except Exception as e:
             if is_last:
                 print(f"[{dev_eui}] Final image error: {e}")
+
+    async def _upload_image(self, dev_eui, jpeg_bytes, sense_time, data_extra=None):
+        """Upload reassembled image to a remote server"""
+        try:
+            form = aiohttp.FormData()
+            form.add_field('snap', jpeg_bytes, filename='image.jpg', content_type='image/jpeg')
+            form.add_field('deviceId', dev_eui)
+            
+            data_payload = {
+                "type": "image",
+                "file": "snap",
+                "sense_time": sense_time
+            }
+            if data_extra:
+                data_payload.update(data_extra)
+                
+            form.add_field('data', json.dumps(data_payload))
+
+            async with aiohttp.ClientSession(headers=self.upload_headers) as session:
+                async with session.post(self.upload_url, data=form, timeout=30) as resp:
+                    if 200 <= resp.status <= 299:
+                        print(f"[{dev_eui}] Successfully uploaded image to {self.upload_url}")
+                    else:
+                        resp_text = await resp.text()
+                        print(f"[{dev_eui}] Upload failed ({resp.status}): {resp_text}")
+        except Exception as e:
+            print(f"[{dev_eui}] Upload exception: {e}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="EdgeEye Image Reassembler (Chirpstack v4 MQTT)")
@@ -258,6 +326,8 @@ if __name__ == '__main__':
     parser.add_argument("--mqtt_pass", help="MQTT password", required=False, default=None)
     parser.add_argument("--redis_url", help="Redis URL for context storage", required=True)
     parser.add_argument("--device_profile_id", help="Filter by Device Profile ID", required=True)
+    parser.add_argument("--upload_url", help="HTTP URL to upload reassembled images", required=False, default=None)
+    parser.add_argument("--upload_headers", help="JSON string of HTTP headers for upload", required=False, default=None)
     args = parser.parse_args()
 
     mqtt_info = {
@@ -265,11 +335,26 @@ if __name__ == '__main__':
         'user': args.mqtt_user.strip() if args.mqtt_user else None,
         'pass': args.mqtt_pass.strip() if args.mqtt_pass else None
     }
+    
+    upload_headers = {}
+    if args.upload_headers:
+        try:
+            upload_headers = json.loads(args.upload_headers)
+        except Exception as e:
+            print(f"Failed to parse upload_headers: {e}")
 
     print(f"EdgeEye Reassembler starting...")
     print(f"MQTT Broker: {mqtt_info['url']}")
     print(f"Filtering by Device Profile ID: {args.device_profile_id}")
+    if args.upload_url:
+        print(f"Upload enabled: {args.upload_url}")
     
-    processor = ImageReassembler(mqtt_info, args.redis_url.strip(), args.device_profile_id.strip())
+    processor = ImageReassembler(
+        mqtt_info, 
+        args.redis_url.strip(), 
+        args.device_profile_id.strip(),
+        upload_url=args.upload_url,
+        upload_headers=upload_headers
+    )
     processor.start()
     processor.loop_forever()
