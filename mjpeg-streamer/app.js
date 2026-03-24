@@ -54,7 +54,9 @@ async function fetchAndSendImage(res, bufferKey, timestampKey, locale, timezone,
             let rawTimestamp = await redisClient.GET(timestampKey);
             let timestampStr = "Unknown";
             if (rawTimestamp) {
-                timestampStr = new Date(rawTimestamp).toLocaleString(locale, { timeZone: timezone });
+                const date = new Date(rawTimestamp);
+                // Simple ISO 8601 string (UTC)
+                timestampStr = date.toISOString();
             }
 
             const processedBuffer = await image.composite([{
@@ -75,15 +77,17 @@ async function fetchAndSendImage(res, bufferKey, timestampKey, locale, timezone,
                 res.write(`Content-Length: ${processedBuffer.length}\r\n\r\n`);
                 res.write(processedBuffer, 'binary');
                 res.write('\r\n--' + boundaryID + '\r\n');
-                console.log(`Sent frame: ${processedBuffer.length} bytes`);
+                return processedBuffer.length;
             } else {
                 res.writeHead(200, { 'Content-Type': 'image/jpeg' });
                 res.end(processedBuffer, 'binary');
+                return processedBuffer.length;
             }
         } catch (e) {
             console.error(`Image processing error: ${e.message}`);
         }
     }
+    return 0;
 }
 
 /**
@@ -132,8 +136,8 @@ var server = http.createServer(async (req, res) => {
 
             const sendHeartbeat = async () => {
                 if (res.writableEnded) return;
-                console.log(`Heartbeat for ${device}`);
-                await fetchAndSendImage(res, bufferKey, timestampKey, locale, timezone, height, true);
+                const size = await fetchAndSendImage(res, bufferKey, timestampKey, locale, timezone, height, true);
+                console.log(`[${device}] Heartbeat frame sent: ${size} bytes`);
                 resetHeartbeat();
             };
 
@@ -143,8 +147,8 @@ var server = http.createServer(async (req, res) => {
             };
 
             await subscriber.subscribe(updateChannel, async (message) => {
-                console.log(`Update notification received for ${device}`);
-                await fetchAndSendImage(res, bufferKey, timestampKey, locale, timezone, height, true);
+                const size = await fetchAndSendImage(res, bufferKey, timestampKey, locale, timezone, height, true);
+                console.log(`[${device}] Updated frame sent: ${size} bytes`);
                 resetHeartbeat();
             });
 
