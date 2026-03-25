@@ -97,14 +97,20 @@ class ImageReassembler:
 
     async def _send_downlink(self, app_id, dev_eui, f_port, payload, confirmed=False):
         topic = f"application/{app_id}/device/{dev_eui}/command/down"
+        
+        # Calculate expiry time (60 seconds from now) safely using timedelta
+        from datetime import timedelta
+        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=60)).replace(microsecond=0).isoformat()
+        
         downlink = {
             "devEui": dev_eui,
             "confirmed": confirmed,
             "fPort": f_port,
-            "data": base64.b64encode(payload).decode('utf-8')
+            "data": base64.b64encode(payload).decode('utf-8'),
+            "expiresAt": expires_at
         }
         self.mqtt_client.publish(topic, json.dumps(downlink))
-        print(f"[{dev_eui}] Downlink sent (FPort {f_port}): {payload.hex()}")
+        print(f"[{dev_eui}] Downlink sent (FPort {f_port}, Expires: {expires_at}): {payload.hex()}")
 
     async def _process_uplink(self, msg):
         dev_eui = msg['dev_eui']
