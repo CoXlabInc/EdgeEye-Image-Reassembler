@@ -7,6 +7,7 @@ import threading
 import traceback
 import argparse
 import aiohttp
+import random
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -97,11 +98,12 @@ class ImageReassembler:
 
     async def _send_downlink(self, app_id, dev_eui, f_port, payload, confirmed=False):
         topic = f"application/{app_id}/device/{dev_eui}/command/down"
-        
-        # Calculate expiry time (60 seconds from now) safely using timedelta
+
+        # Calculate expiry time (60-70 seconds from now) with random offset (0-10s) including milliseconds
         from datetime import timedelta
-        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=60)).replace(microsecond=0).isoformat()
-        
+        random_offset = random.uniform(0, 10)
+        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=60 + random_offset)).isoformat()
+
         downlink = {
             "devEui": dev_eui,
             "confirmed": confirmed,
@@ -111,7 +113,6 @@ class ImageReassembler:
         }
         self.mqtt_client.publish(topic, json.dumps(downlink))
         print(f"[{dev_eui}] Downlink sent (FPort {f_port}, Expires: {expires_at}): {payload.hex()}")
-
     async def _process_uplink(self, msg):
         dev_eui = msg['dev_eui']
         
@@ -172,7 +173,7 @@ class ImageReassembler:
         last_dl_key = f"{prefix}:last_dl:{dev_eui}:{epoch}"
 
         if await r.exists(completed_key):
-            if len(frag_data) > 0 and not await r.exists(last_dl_key):
+            if not await r.exists(last_dl_key):
                 await self._send_downlink(app_id, dev_eui, 4, epoch.to_bytes(5, 'little'))
                 await r.set(last_dl_key, 1, ex=10)
             return
@@ -185,9 +186,8 @@ class ImageReassembler:
             print(f"[{dev_eui}] New image detected: 0x{epoch:08X} (replacing 0x{active_epoch:08X})")
             await r.set(active_epoch_key, epoch, ex=86400)
 
-        if len(frag_data) == 0 and not first_frag:
-            return
-
+        # Removed: if len(frag_data) == 0 and not first_frag: return
+        
         state = await r.get(state_key)
         state = json.loads(state) if state else {'received': 0, 'total_size': None, 'meta': []}
         if 'meta' not in state: state['meta'] = []
@@ -214,8 +214,8 @@ class ImageReassembler:
             reassembled_offset = min(b[0] for b in missing_blocks)
             await r.set(missing_key, json.dumps(missing_blocks), ex=86400)
 
-            # Send gap request only if we received meaningful data in this packet
-            if len(frag_data) > 0 and not await r.exists(last_dl_key):
+            # Send gap request if we have missing blocks and not throttled
+            if not await r.exists(last_dl_key):
                 m = min(missing_blocks, key=lambda x: x[0])
                 print(f"[{dev_eui}:{sense_time}] Packet loss! Missing: {m[0]}~{m[1]} (Epoch: 0x{epoch:08X})")
                 req = raw[1:6] + m[0].to_bytes(3, 'little') + m[1].to_bytes(3, 'little')
@@ -232,9 +232,9 @@ class ImageReassembler:
         percent = (reassembled_offset / total * 100) if total > 0 else 0
         print(f"[{dev_eui}:{sense_time}] Progress: {reassembled_offset}/{total} ({percent:.2f}%) +{len(frag_data)}B (fCnt:{msg['f_cnt']})")
 
-        if len(frag_data) > 0:
-            await self._finalize_image(r, dev_eui, app_id, epoch, sense_time, buffer_key, 
-                                       reassembled_offset, total, last_frag, completed_key, state_key, state)
+        # Always check for finalization to allow empty verification packets to finish the image
+        await self._finalize_image(r, dev_eui, app_id, epoch, sense_time, buffer_key, 
+                                   reassembled_offset, total, last_frag, completed_key, state_key, state)
 
     async def _apply_fragment(self, r, key, offset, data, received, missing_blocks):
         if len(data) == 0:
