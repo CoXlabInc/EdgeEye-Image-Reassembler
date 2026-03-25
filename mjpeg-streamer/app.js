@@ -99,7 +99,7 @@ var server = http.createServer(async (req, res) => {
     let params = new URLSearchParams(uri[1]);
     
     if (path.length >= 1 && path[0] !== 'healthcheck' && path[0] !== '') {
-        const device = path[0];
+        const device = path[0].toLowerCase();
         const isLastRequest = path.length === 2 && path[1] === 'last';
         
         let bufferKey = `ImageToRtsp:${device}:image`;
