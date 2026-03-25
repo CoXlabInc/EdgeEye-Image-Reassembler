@@ -240,9 +240,12 @@ class ImageReassembler:
         percent = (reassembled_offset / total * 100) if total > 0 else 0
         print(f"[{dev_eui}:{sense_time}] Progress: {reassembled_offset}/{total} ({percent:.2f}%) +{len(frag_data)}B (fCnt:{msg['f_cnt']})")
 
+        # If all fragments are received, pass the full total size to finalization
+        final_len = total if not missing_blocks else reassembled_offset
+
         # Always check for finalization to allow empty verification packets to finish the image
         await self._finalize_image(r, dev_eui, app_id, epoch, sense_time, buffer_key, 
-                                   reassembled_offset, total, last_frag, completed_key, state_key, state)
+                                   final_len, total, last_frag, completed_key, state_key, state)
 
     async def _apply_fragment(self, r, key, offset, data, received, missing_blocks):
         offset_end = offset + len(data)
@@ -290,7 +293,7 @@ class ImageReassembler:
             await r.publish(f"EdgeEye:updated:{dev_eui}", "updated")
 
             if total_size and reassembled_len >= total_size:
-                print(f"[{dev_eui}] Reassembly complete! {len(jpeg_bytes)} bytes")
+                print(f"[{dev_eui}] Reassembly complete! {len(jpeg_bytes)} bytes (Original: {total_size} bytes)")
                 await r.set(f"{rtsp_base}:image:last", jpeg_bytes, ex=86400)
                 await r.set(f"{rtsp_base}:sense_time:last", sense_time, ex=86400)
                 await r.set(completed_key, 1, ex=86400)
