@@ -240,12 +240,9 @@ class ImageReassembler:
         percent = (reassembled_offset / total * 100) if total > 0 else 0
         print(f"[{dev_eui}:{sense_time}] Progress: {reassembled_offset}/{total} ({percent:.2f}%) +{len(frag_data)}B (fCnt:{msg['f_cnt']})")
 
-        # If all fragments are received, pass the full total size to finalization
-        final_len = total if not missing_blocks else reassembled_offset
-
-        # Always check for finalization to allow empty verification packets to finish the image
+        # Always check for finalization using the actual contiguous offset
         await self._finalize_image(r, dev_eui, app_id, epoch, sense_time, buffer_key, 
-                                   final_len, total, last_frag, completed_key, state_key, state)
+                                   reassembled_offset, total, last_frag, completed_key, state_key, state)
 
     async def _apply_fragment(self, r, key, offset, data, received, missing_blocks):
         offset_end = offset + len(data)
