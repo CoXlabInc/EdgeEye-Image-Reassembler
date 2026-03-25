@@ -209,6 +209,8 @@ class ImageReassembler:
         missing_blocks = json.loads(missing_raw) if missing_raw else []
         
         new_offset_next = await self._apply_fragment(r, buffer_key, offset, frag_data, state['received'], missing_blocks)
+        reassembled_offset = new_offset_next
+
         # Send gap request if we have missing blocks and not throttled
         # Verification packets (empty) can trigger a downlink every 5 seconds to speed up final reassembly.
         is_verification = (len(frag_data) == 0)
