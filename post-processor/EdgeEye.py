@@ -237,14 +237,17 @@ class ImageReassembler:
                                    reassembled_offset, total, last_frag, completed_key, state_key, state)
 
     async def _apply_fragment(self, r, key, offset, data, received, missing_blocks):
-        if len(data) == 0:
-            return received
-
         offset_end = offset + len(data)
+
+        # Gap detection from the header's offset
         if offset > received:
             if [received, offset] not in missing_blocks:
                 missing_blocks.append([received, offset])
-        elif offset < received:
+
+        if len(data) == 0:
+            return received
+
+        if offset < received:
             new_missing = []
             for b in missing_blocks:
                 if offset <= b[0] and offset_end >= b[1]: continue
