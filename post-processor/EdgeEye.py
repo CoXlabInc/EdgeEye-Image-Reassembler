@@ -277,19 +277,23 @@ class ImageReassembler:
         if not img_data: return
         
         img_data = img_data[:reassembled_len]
+
+        # Update raw data and notify streamers even if the image is partial
+        # Sharp in mjpeg-streamer can handle truncated JPEGs with failOn: 'none'
+        await r.set(f"{rtsp_base}:image", img_data, ex=86400)
+        await r.set(f"{rtsp_base}:sense_time", sense_time, ex=86400)
+        await r.publish(f"EdgeEye:updated:{dev_eui}", "updated")
+
         try:
             img = Image.open(io.BytesIO(img_data))
-            with io.BytesIO() as output:
-                img.save(output, format="JPEG")
-                jpeg_bytes = output.getvalue()
+            # (Optional) Re-save with Pillow if we want to ensure format or apply transformations
+            # For now, we rely on raw data for streaming speed
             
-            await r.set(f"{rtsp_base}:image", jpeg_bytes, ex=86400)
-            await r.set(f"{rtsp_base}:sense_time", sense_time, ex=86400)
-            
-            # Notify streamers
-            await r.publish(f"EdgeEye:updated:{dev_eui}", "updated")
-
             if total_size and reassembled_len >= total_size:
+                with io.BytesIO() as output:
+                    img.save(output, format="JPEG")
+                    jpeg_bytes = output.getvalue()
+                
                 print(f"[{dev_eui}] Reassembly complete! {len(jpeg_bytes)} bytes (Original: {total_size} bytes)")
                 await r.set(f"{rtsp_base}:image:last", jpeg_bytes, ex=86400)
                 await r.set(f"{rtsp_base}:sense_time:last", sense_time, ex=86400)
