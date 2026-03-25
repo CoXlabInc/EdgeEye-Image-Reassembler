@@ -96,7 +96,7 @@ class ImageReassembler:
         except Exception as e:
             print(f"Error handling MQTT message: {e}")
 
-    async def _send_downlink(self, app_id, dev_eui, f_port, payload, confirmed=False):
+    async def _send_downlink(self, app_id, dev_eui, f_port, payload, confirmed=True):
         topic = f"application/{app_id}/device/{dev_eui}/command/down"
 
         # Calculate expiry time (60-70 seconds from now) with random offset (0-10s) including milliseconds
@@ -211,24 +211,20 @@ class ImageReassembler:
         new_offset_next = await self._apply_fragment(r, buffer_key, offset, frag_data, state['received'], missing_blocks)
         reassembled_offset = new_offset_next
 
-        # Send gap request if we have missing blocks and not throttled
-        # Verification packets (empty) can trigger a downlink every 5 seconds to speed up final reassembly.
-        is_verification = (len(frag_data) == 0)
-        throttle_ttl = await r.ttl(last_dl_key)
-        
+        # Send gap request if we have missing blocks
         if missing_blocks:
             reassembled_offset = min(b[0] for b in missing_blocks)
             await r.set(missing_key, json.dumps(missing_blocks), ex=86400)
 
-            # Allow if: 
-            # 1. No throttle exists (ttl < 0)
-            # 2. OR it's a verification packet and at least 5s have passed since last downlink (ttl < 55 assuming 60s base)
-            if throttle_ttl < 0 or (is_verification and throttle_ttl < 55):
-                m = min(missing_blocks, key=lambda x: x[0])
+            # Request missing block (with per-block throttling)
+            m = min(missing_blocks, key=lambda x: x[0])
+            block_dl_key = f"{prefix}:last_dl:{dev_eui}:{epoch}:{m[0]}_{m[1]}"
+            
+            if not await r.exists(block_dl_key):
                 print(f"[{dev_eui}:{sense_time}] Packet loss! Missing: {m[0]}~{m[1]} (Epoch: 0x{epoch:08X})")
                 req = raw[1:6] + m[0].to_bytes(3, 'little') + m[1].to_bytes(3, 'little')
                 await self._send_downlink(app_id, dev_eui, 4, req)
-                await r.set(last_dl_key, 1, ex=60)
+                await r.set(block_dl_key, 1, ex=30) # 30s throttle for THIS specific block
         else:
             await r.delete(missing_key)
 
@@ -238,7 +234,15 @@ class ImageReassembler:
 
         total = state['total_size']
         percent = (reassembled_offset / total * 100) if total > 0 else 0
-        print(f"[{dev_eui}:{sense_time}] Progress: {reassembled_offset}/{total} ({percent:.2f}%) +{len(frag_data)}B (fCnt:{msg['f_cnt']})")
+        max_reached = state['received']
+        max_percent = (max_reached / total * 100) if total > 0 else 0
+        
+        if len(frag_data) > 0:
+            info = f"(Frag:{offset}-{offset+len(frag_data)}, {len(frag_data)}B, fCnt:{msg['f_cnt']})"
+        else:
+            info = f"(Verification, fCnt:{msg['f_cnt']})"
+            
+        print(f"[{dev_eui}:{sense_time}] Progress: {reassembled_offset}/{total} ({percent:.2f}%) [Max: {max_reached}/{total} ({max_percent:.2f}%)] {info}")
 
         # Always check for finalization using the actual contiguous offset
         await self._finalize_image(r, dev_eui, app_id, epoch, sense_time, buffer_key, 
