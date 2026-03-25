@@ -212,6 +212,7 @@ class ImageReassembler:
         reassembled_offset = new_offset_next
 
         # Send gap request if we have missing blocks
+        is_verification = (len(frag_data) == 0)
         if missing_blocks:
             reassembled_offset = min(b[0] for b in missing_blocks)
             await r.set(missing_key, json.dumps(missing_blocks), ex=86400)
@@ -220,11 +221,14 @@ class ImageReassembler:
             m = min(missing_blocks, key=lambda x: x[0])
             block_dl_key = f"{prefix}:last_dl:{dev_eui}:{epoch}:{m[0]}_{m[1]}"
             
-            if not await r.exists(block_dl_key):
+            # Skip throttling for verification packets to speed up final reassembly
+            if is_verification or not await r.exists(block_dl_key):
                 print(f"[{dev_eui}:{sense_time}] Packet loss! Missing: {m[0]}~{m[1]} (Epoch: 0x{epoch:08X})")
                 req = raw[1:6] + m[0].to_bytes(3, 'little') + m[1].to_bytes(3, 'little')
                 await self._send_downlink(app_id, dev_eui, 4, req)
-                await r.set(block_dl_key, 1, ex=30) # 30s throttle for THIS specific block
+                
+                if not is_verification:
+                    await r.set(block_dl_key, 1, ex=30) # 30s throttle for THIS specific block
         else:
             await r.delete(missing_key)
 
