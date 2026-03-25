@@ -327,7 +327,7 @@ class ImageReassembler:
             form.add_field('data', json.dumps(data_payload))
 
             async with aiohttp.ClientSession(headers=self.upload_headers) as session:
-                async with session.post(self.upload_url, data=form, timeout=30) as resp:
+                async with session.post(self.upload_url, data=form, timeout=30, ssl=False) as resp:
                     if 200 <= resp.status <= 299:
                         print(f"[{dev_eui}] Successfully uploaded image to {self.upload_url}")
                     else:
