@@ -325,17 +325,15 @@ class ImageReassembler:
         """Upload reassembled image to a remote server"""
         try:
             form = aiohttp.FormData()
+            # Image file field (name: 'snap', filename: 'image.jpg')
             form.add_field('snap', jpeg_bytes, filename='image.jpg', content_type='image/jpeg')
-            form.add_field('deviceId', dev_eui)
             
-            data_payload = {
-                "type": "image",
-                "file": "snap",
-                "sense_time": sense_time
-            }
-            if data_extra:
-                data_payload.update(data_extra)
-                
+            # Independent metadata fields
+            form.add_field('deviceId', dev_eui)
+            form.add_field('_timestamp', sense_time)
+            
+            # Pure data payload without redundant metadata
+            data_payload = data_extra if data_extra else {}
             form.add_field('data', json.dumps(data_payload))
 
             async with aiohttp.ClientSession(headers=self.upload_headers) as session:

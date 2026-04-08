@@ -60,10 +60,14 @@ Services:
 - **Last Completed**: `http://[SERVER_IP]:8080/[DevEUI]/last`
 
 ### Automatic Upload
-If `UPLOAD_URL` is set, the system performs a `multipart/form-data` POST request when reassembly is complete:
-- `snap`: JPEG image file.
+If `UPLOAD_URL` is set, the system performs a `multipart/form-data` POST request when reassembly is complete. The request follows this structure:
+
+- `snap`: JPEG binary file (filename: `image.jpg`, content-type: `image/jpeg`).
 - `deviceId`: DevEUI of the device.
-- `data`: JSON string with `sense_time`, `system_voltage`, and `ambient_light_lux`.
+- `_timestamp`: ISO 8601 timestamp string (UTC).
+- `data`: JSON string containing sensor data:
+    - `system_voltage`: System voltage in Volts (typically present).
+    - `ambient_light_lux`: Ambient light level in Lux (optional).
 
 ## License
 
