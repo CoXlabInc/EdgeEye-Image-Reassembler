@@ -42,7 +42,12 @@ class ImageReassembler:
         asyncio.set_event_loop(self.event_loop)
         
         def run_loop():
-            self.event_loop.run_forever()
+            try:
+                print("Asyncio event loop started.")
+                self.event_loop.run_forever()
+            except Exception as e:
+                print(f"Asyncio event loop crashed: {e}")
+                traceback.print_exc()
         threading.Thread(target=run_loop, daemon=True).start()
 
         url_parsed = urlparse(self.mqtt_info['url'])
@@ -54,19 +59,42 @@ class ImageReassembler:
             self.mqtt_client.username_pw_set(self.mqtt_info['user'], self.mqtt_info['pass'])
             
         self.mqtt_client.on_connect = self._on_mqtt_connect
+        self.mqtt_client.on_disconnect = self._on_mqtt_disconnect
         self.mqtt_client.on_message = self._on_mqtt_message
+        # self.mqtt_client.on_log = lambda c, u, l, buf: print(f"MQTT Log: {buf}")
         
         print(f"Connecting to MQTT Broker: {host}:{port}...")
         self.mqtt_client.connect(host, port, 60)
+        
+        # Initialize aiohttp session in the event loop
+        self._session = None
+        async def init_session():
+            self._session = aiohttp.ClientSession(headers=self.upload_headers)
+        asyncio.run_coroutine_threadsafe(init_session(), self.event_loop)
+        
         return self.mqtt_client
 
     def loop_forever(self):
         if self.mqtt_client:
+            # Add a heartbeat check
+            def heartbeat():
+                while True:
+                    if self.mqtt_client.is_connected():
+                        print(f"[{datetime.now().isoformat()}] Reassembler is alive and connected to MQTT.")
+                    else:
+                        print(f"[{datetime.now().isoformat()}] Reassembler is alive but MQTT DISCONNECTED.")
+                    import time
+                    time.sleep(60)
+            threading.Thread(target=heartbeat, daemon=True).start()
+            
             self.mqtt_client.loop_forever()
 
     def _on_mqtt_connect(self, client, userdata, flags, reason_code, properties):
         print(f"Connected to MQTT Broker (Reason Code: {reason_code})")
         client.subscribe("application/+/device/+/event/up")
+
+    def _on_mqtt_disconnect(self, client, userdata, flags, reason_code, properties):
+        print(f"Disconnected from MQTT Broker (Reason Code: {reason_code})")
 
     def _on_mqtt_message(self, client, userdata, msg):
         try:
@@ -323,6 +351,10 @@ class ImageReassembler:
 
     async def _upload_image(self, dev_eui, jpeg_bytes, sense_time, data_extra=None):
         """Upload reassembled image to a remote server"""
+        if not self._session:
+            print(f"[{dev_eui}] Session not initialized yet. Skipping upload.")
+            return
+
         try:
             form = aiohttp.FormData()
             # Image file field (name: 'snap', filename: 'image.jpg')
@@ -336,13 +368,12 @@ class ImageReassembler:
             data_payload = data_extra if data_extra else {}
             form.add_field('data', json.dumps(data_payload))
 
-            async with aiohttp.ClientSession(headers=self.upload_headers) as session:
-                async with session.post(self.upload_url, data=form, timeout=30, ssl=False) as resp:
-                    if 200 <= resp.status <= 299:
-                        print(f"[{dev_eui}] Successfully uploaded image to {self.upload_url}")
-                    else:
-                        resp_text = await resp.text()
-                        print(f"[{dev_eui}] Upload failed ({resp.status}): {resp_text}")
+            async with self._session.post(self.upload_url, data=form, timeout=30, ssl=False) as resp:
+                if 200 <= resp.status <= 299:
+                    print(f"[{dev_eui}] Successfully uploaded image to {self.upload_url}")
+                else:
+                    resp_text = await resp.text()
+                    print(f"[{dev_eui}] Upload failed ({resp.status}): {resp_text}")
         except Exception as e:
             print(f"[{dev_eui}] Upload exception: {e}")
 
