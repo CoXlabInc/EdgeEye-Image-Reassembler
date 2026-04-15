@@ -36,7 +36,13 @@ class ImageReassembler:
             print("Redis URL is required.")
             return None
 
-        self.pool = redis.ConnectionPool.from_url(self.redis_url)
+        # Add socket timeouts to prevent indefinite hanging
+        self.pool = redis.ConnectionPool.from_url(
+            self.redis_url, 
+            socket_timeout=10, 
+            socket_connect_timeout=10,
+            health_check_interval=30
+        )
 
         self.event_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.event_loop)
@@ -54,20 +60,23 @@ class ImageReassembler:
         host = url_parsed.hostname
         port = url_parsed.port or 1883
         
-        self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        # Use a unique client ID to avoid session conflicts
+        client_id = f"edgeeye-reassembler-{random.randint(1000, 9999)}"
+        self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id)
         if self.mqtt_info.get('user') and self.mqtt_info.get('pass'):
             self.mqtt_client.username_pw_set(self.mqtt_info['user'], self.mqtt_info['pass'])
             
         self.mqtt_client.on_connect = self._on_mqtt_connect
         self.mqtt_client.on_disconnect = self._on_mqtt_disconnect
         self.mqtt_client.on_message = self._on_mqtt_message
-        # self.mqtt_client.on_log = lambda c, u, l, buf: print(f"MQTT Log: {buf}")
+        self.mqtt_client.on_subscribe = self._on_mqtt_subscribe
         
-        print(f"Connecting to MQTT Broker: {host}:{port}...")
+        print(f"Connecting to MQTT Broker: {host}:{port} with ClientID: {client_id}...")
         self.mqtt_client.connect(host, port, 60)
         
         # Initialize aiohttp session in the event loop
         self._session = None
+        self._message_count = 0
         async def init_session():
             self._session = aiohttp.ClientSession(headers=self.upload_headers)
         asyncio.run_coroutine_threadsafe(init_session(), self.event_loop)
@@ -79,10 +88,9 @@ class ImageReassembler:
             # Add a heartbeat check
             def heartbeat():
                 while True:
-                    if self.mqtt_client.is_connected():
-                        print(f"[{datetime.now().isoformat()}] Reassembler is alive and connected to MQTT.")
-                    else:
-                        print(f"[{datetime.now().isoformat()}] Reassembler is alive but MQTT DISCONNECTED.")
+                    mqtt_status = "CONNECTED" if self.mqtt_client.is_connected() else "DISCONNECTED"
+                    loop_status = "RUNNING" if self.event_loop.is_running() else "STOPPED"
+                    print(f"[{datetime.now().isoformat()}] Heartbeat: MQTT={mqtt_status}, Loop={loop_status}, MsgCount={self._message_count}")
                     import time
                     time.sleep(60)
             threading.Thread(target=heartbeat, daemon=True).start()
@@ -90,13 +98,21 @@ class ImageReassembler:
             self.mqtt_client.loop_forever()
 
     def _on_mqtt_connect(self, client, userdata, flags, reason_code, properties):
-        print(f"Connected to MQTT Broker (Reason Code: {reason_code})")
-        client.subscribe("application/+/device/+/event/up")
+        if reason_code == 0:
+            print(f"Connected to MQTT Broker (Reason Code: {reason_code})")
+            client.subscribe("application/+/device/+/event/up")
+        else:
+            print(f"Failed to connect to MQTT Broker (Reason Code: {reason_code})")
 
     def _on_mqtt_disconnect(self, client, userdata, flags, reason_code, properties):
         print(f"Disconnected from MQTT Broker (Reason Code: {reason_code})")
 
+    def _on_mqtt_subscribe(self, client, userdata, mid, reason_codes, properties):
+        print(f"Subscribed to topic (MID: {mid}, Reason Codes: {reason_codes})")
+
     def _on_mqtt_message(self, client, userdata, msg):
+        self._message_count += 1
+        print(f"DEBUG: Message received on {msg.topic}")
         try:
             data = json.loads(msg.payload)
             device_info = data.get('deviceInfo', {})
