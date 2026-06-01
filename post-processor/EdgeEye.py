@@ -29,6 +29,13 @@ class ImageReassembler:
         self.event_loop = None
         self.mqtt_client = None
         self.device_locks = {} # Per-device locks to ensure sequential processing
+
+        self.FLAG_FIRST_FRAG = 0x01
+        self.FLAG_LAST_FRAG  = 0x02
+        self.FLAG_SYSV       = 0x04
+        self.FLAG_ALS        = 0x08
+        self.FLAG_MULTI_UP   = 0x10
+        self.FLAG_OBJDET     = 0x20
         
     def start(self):
         """Initialize and start the processor"""
@@ -112,7 +119,6 @@ class ImageReassembler:
 
     def _on_mqtt_message(self, client, userdata, msg):
         self._message_count += 1
-        print(f"DEBUG: Message received on {msg.topic}")
         try:
             data = json.loads(msg.payload)
             device_info = data.get('deviceInfo', {})
@@ -176,9 +182,31 @@ class ImageReassembler:
                 traceback.print_exc()
 
     def _handle_fail_report(self, dev_eui, raw):
-        errors = {0: "Camera boot failed", 1: "Camera snap failed", 2: "Send failed"}
-        error_msg = errors.get(raw[0], f"Unknown fail ({raw[0]})")
-        print(f"[{dev_eui}] Device Error: {error_msg}")
+        categories = {0: "Boot", 1: "Snap", 2: "Send"}
+        snap_sub = {0: "Memory", 1: "Filesystem", 2: "Encoding"}
+        send_sub = {0: "Memory", 1: "Filesystem", 2: "Busy", 3: "User interrupt"}
+
+        cat = raw[0] if len(raw) > 0 else None
+        sub = raw[1] if len(raw) > 1 else None
+        sysv = int.from_bytes(raw[2:4], 'little') / 1000.0 if len(raw) > 3 else None
+
+        cat_name = categories.get(cat, f"Unknown({cat})")
+
+        sub_name = ""
+        if cat == 1:
+            sub_name = snap_sub.get(sub, f"Unknown({sub})")
+        elif cat == 2:
+            sub_name = send_sub.get(sub, f"Unknown({sub})")
+        elif sub is not None:
+            sub_name = f"Sub={sub}"
+
+        parts = [f"[{dev_eui}] Device Error: {cat_name}"]
+        if sub_name:
+            parts.append(f"({sub_name})")
+        if sysv is not None:
+            parts.append(f"| {sysv:.3f}V")
+
+        print(" ".join(parts))
 
     async def _handle_image_fragment(self, r, msg):
         dev_eui = msg['dev_eui']
@@ -194,17 +222,17 @@ class ImageReassembler:
         
         i = 9
         sysv = None
-        if (flags & (1 << 2)):
+        if (flags & self.FLAG_SYSV):
             sysv = int.from_bytes(raw[i:i+2], 'little') / 1000.0
             i += 2
         
         als = None
-        if (flags & (1 << 3)):
+        if (flags & self.FLAG_ALS):
             als = int.from_bytes(raw[i:i+3], 'little')
             i += 3
         
-        first_frag = bool(flags & (1 << 0))
-        last_frag = bool(flags & (1 << 1))
+        first_frag = bool(flags & self.FLAG_FIRST_FRAG)
+        last_frag = bool(flags & self.FLAG_LAST_FRAG)
         frag_data = raw[i:]
         sense_time = datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat().replace('+00:00', 'Z')
 
@@ -215,6 +243,37 @@ class ImageReassembler:
         state_key = f"{prefix}:state:{dev_eui}:{epoch}"
         missing_key = f"{prefix}:missing:{dev_eui}:{epoch}"
         last_dl_key = f"{prefix}:last_dl:{dev_eui}:{epoch}"
+
+        if (flags & self.FLAG_OBJDET) and frag_data:
+            det = []
+            obj_size = 11
+            obj_count = len(frag_data) // obj_size
+            for j in range(obj_count):
+                o = frag_data[j*obj_size:(j+1)*obj_size]
+                if len(o) == obj_size:
+                    det.append({
+                        'x':     int.from_bytes(o[0:2], 'little') / 65535.0,
+                        'y':     int.from_bytes(o[2:4], 'little') / 65535.0,
+                        'w':     int.from_bytes(o[4:6], 'little') / 65535.0,
+                        'h':     int.from_bytes(o[6:8], 'little') / 65535.0,
+                        'class': o[8],
+                        'score': int.from_bytes(o[9:11], 'little') / 65535.0,
+                    })
+            if first_frag:
+                state = {'received': 0, 'total_size': offset, 'meta': []}
+                await r.set(active_epoch_key, epoch, ex=86400)
+            else:
+                existing = await r.get(state_key)
+                state = json.loads(existing) if existing else {'received': 0, 'total_size': None, 'meta': []}
+                if 'meta' not in state:
+                    state['meta'] = []
+            state['det'] = det
+            if sysv is not None:
+                state['system_voltage'] = sysv
+            state['meta'].append({'fCnt': msg['f_cnt'], 'ts': datetime.now(timezone.utc).isoformat()})
+            await r.set(state_key, json.dumps(state), ex=3600)
+            print(f"[{dev_eui}:{sense_time}] Object detection: {obj_count} objects (Epoch: 0x{epoch:08X})")
+            return
 
         if await r.exists(completed_key):
             if not await r.exists(last_dl_key):
@@ -359,6 +418,7 @@ class ImageReassembler:
                     data_extra = {}
                     if 'system_voltage' in state: data_extra['system_voltage'] = state['system_voltage']
                     if 'ambient_light_lux' in state: data_extra['ambient_light_lux'] = state['ambient_light_lux']
+                    if 'det' in state: data_extra['det'] = state['det']
                     asyncio.create_task(self._upload_image(dev_eui, jpeg_bytes, sense_time, data_extra))
                 
         except Exception as e:
