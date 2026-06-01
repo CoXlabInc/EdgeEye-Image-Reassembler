@@ -38,7 +38,10 @@ This project is a reference bridge for integrating [EdgeEye](https://www.coxlab.
      - **Note**: This bridge uses the Device Profile ID to identify EdgeEye packets. It is **highly recommended** to create and use a dedicated Device Profile for EdgeEye devices to avoid processing unrelated traffic.
    - `UPLOAD_URL`: (Optional) Remote HTTP endpoint for image uploads.
    - `UPLOAD_HEADERS`: (Optional) JSON string of HTTP headers for uploads (e.g., `{"X-API-Key": "your-token"}`).
+   - `DET_UPLOAD_MODE`: (Optional) How to upload object detection data. `1`=included with snap, `2`=det first then snap (default), `3`=det first then snap alone (without det).
+   - `UPLOAD_OVERLAY`: (Optional) Comma-separated overlay types for the upload snap. `timestamp,bbox` (default) includes both; `timestamp` for timestamp only; `bbox` for bbox only; `none` for raw JPEG.
    - `TZ`: Local timezone (e.g., `Asia/Seoul`).
+   - `LANG`: Locale (e.g., `ko_KR.UTF-8`).
 
 ## Execution
 
@@ -56,18 +59,25 @@ Services:
 ## Usage
 
 ### MJPEG Streaming
-- **Live Reassembly**: `http://[SERVER_IP]:8080/[DevEUI]/live`
-- **Last Completed**: `http://[SERVER_IP]:8080/[DevEUI]/last`
+- **Live Reassembly**: `http://[SERVER_IP]:8083/[DevEUI]` (with `?det=true` for bbox overlay)
+- **Last Completed**: `http://[SERVER_IP]:8083/[DevEUI]/last` (also supports `?det=true`)
 
 ### Automatic Upload
-If `UPLOAD_URL` is set, the system performs a `multipart/form-data` POST request when reassembly is complete. The request follows this structure:
+If `UPLOAD_URL` is set, the system performs a `multipart/form-data` POST request when reassembly is complete. The uploaded `snap` is a composed JPEG with timestamp overlay (and bbox overlay if available).
 
-- `snap`: JPEG binary file (filename: `image.jpg`, content-type: `image/jpeg`).
+**Upload fields:**
+- `snap`: Composed JPEG binary (filename: `image.jpg`, content-type: `image/jpeg`).
 - `deviceId`: DevEUI of the device.
-- `_timestamp`: ISO 8601 timestamp string (UTC).
+- `_timestamp`: ISO 8601 timestamp string (UTC/local).
 - `data`: JSON string containing sensor data:
     - `system_voltage`: System voltage in Volts (typically present).
     - `ambient_light_lux`: Ambient light level in Lux (optional).
+    - `det`: Object detection list (optional, mode-dependent).
+
+**`DET_UPLOAD_MODE` behavior:**
+- **1**: Detection data is included in the `data` field of a single upload with `snap`.
+- **2** (default): Detection data is uploaded first (no `snap`). When reassembly completes, `snap` (with bbox overlay) + detection data is uploaded again.
+- **3**: Detection data is uploaded first (no `snap`). When reassembly completes, `snap` without detection data is uploaded separately.
 
 ## License
 

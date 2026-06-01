@@ -19,7 +19,9 @@ services:
     environment:
       - TZ=${TZ:-UTC}
       - LANG=${LANG:-en_US.UTF-8}
-    command: npm start -- -r ${REDIS_URL:-redis://redis}
+      - UPLOAD_URL=${UPLOAD_URL:-}
+      - UPLOAD_HEADERS=${UPLOAD_HEADERS:-}
+    command: npm start -- -r ${REDIS_URL:-redis://redis} -u ${UPLOAD_URL:-} -M ${DET_UPLOAD_MODE:-2} -O ${UPLOAD_OVERLAY:-timestamp,bbox}
 
   edgeeye_reassembler:
     container_name: edgeeye_reassembler
@@ -43,9 +45,5 @@ services:
       - ${REDIS_URL:-redis://redis}
       - --device_profile_id
       - ${DEVICE_PROFILE_ID}
-      - --upload_url
-      - ${UPLOAD_URL:-}
-      - --upload_headers
-      - ${UPLOAD_HEADERS:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"

@@ -6,7 +6,6 @@ import asyncio
 import threading
 import traceback
 import argparse
-import aiohttp
 import random
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -18,12 +17,10 @@ from PIL import Image, ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 class ImageReassembler:
-    def __init__(self, mqtt_info, redis_url, device_profile_id, upload_url=None, upload_headers=None):
+    def __init__(self, mqtt_info, redis_url, device_profile_id):
         self.mqtt_info = mqtt_info
         self.redis_url = redis_url
         self.device_profile_id = device_profile_id
-        self.upload_url = upload_url
-        self.upload_headers = upload_headers if upload_headers else {}
         
         self.pool = None
         self.event_loop = None
@@ -81,12 +78,7 @@ class ImageReassembler:
         print(f"Connecting to MQTT Broker: {host}:{port} with ClientID: {client_id}...")
         self.mqtt_client.connect(host, port, 60)
         
-        # Initialize aiohttp session in the event loop
-        self._session = None
         self._message_count = 0
-        async def init_session():
-            self._session = aiohttp.ClientSession(headers=self.upload_headers)
-        asyncio.run_coroutine_threadsafe(init_session(), self.event_loop)
         
         return self.mqtt_client
 
@@ -272,6 +264,9 @@ class ImageReassembler:
                 state['system_voltage'] = sysv
             state['meta'].append({'fCnt': msg['f_cnt'], 'ts': datetime.now(timezone.utc).isoformat()})
             await r.set(state_key, json.dumps(state), ex=3600)
+            await r.set(f"ImageToRtsp:{dev_eui}:det", json.dumps(det), ex=86400)
+            await r.set(f"ImageToRtsp:{dev_eui}:sense_time", sense_time, ex=86400)
+            await r.publish(f"EdgeEye:updated:{dev_eui}", "det")
             print(f"[{dev_eui}:{sense_time}] Object detection: {obj_count} objects (Epoch: 0x{epoch:08X})")
             return
 
@@ -408,50 +403,25 @@ class ImageReassembler:
                 print(f"[{dev_eui}] Reassembly complete! {len(jpeg_bytes)} bytes (Original: {total_size} bytes)")
                 await r.set(f"{rtsp_base}:image:last", jpeg_bytes, ex=86400)
                 await r.set(f"{rtsp_base}:sense_time:last", sense_time, ex=86400)
+                if 'det' in state:
+                    await r.set(f"{rtsp_base}:det:last", json.dumps(state['det']), ex=86400)
                 await r.set(completed_key, 1, ex=86400)
                 await self._send_downlink(app_id, dev_eui, 4, epoch.to_bytes(5, 'little'))
                 await r.delete(buffer_key)
                 await r.delete(state_key)
                 
-                # Perform HTTP upload if configured
-                if self.upload_url:
-                    data_extra = {}
-                    if 'system_voltage' in state: data_extra['system_voltage'] = state['system_voltage']
-                    if 'ambient_light_lux' in state: data_extra['ambient_light_lux'] = state['ambient_light_lux']
-                    if 'det' in state: data_extra['det'] = state['det']
-                    asyncio.create_task(self._upload_image(dev_eui, jpeg_bytes, sense_time, data_extra))
+                # Notify Node.js streamer to perform composite + upload
+                upload_meta = {
+                    'sense_time': sense_time,
+                    'system_voltage': state.get('system_voltage'),
+                    'ambient_light_lux': state.get('ambient_light_lux'),
+                    'det': state.get('det'),
+                }
+                await r.set(f"{rtsp_base}:upload:ready", json.dumps(upload_meta), ex=300)
                 
         except Exception as e:
             if is_last:
                 print(f"[{dev_eui}] Final image error: {e}")
-
-    async def _upload_image(self, dev_eui, jpeg_bytes, sense_time, data_extra=None):
-        """Upload reassembled image to a remote server"""
-        if not self._session:
-            print(f"[{dev_eui}] Session not initialized yet. Skipping upload.")
-            return
-
-        try:
-            form = aiohttp.FormData()
-            # Image file field (name: 'snap', filename: 'image.jpg')
-            form.add_field('snap', jpeg_bytes, filename='image.jpg', content_type='image/jpeg')
-            
-            # Independent metadata fields
-            form.add_field('deviceId', dev_eui)
-            form.add_field('_timestamp', sense_time)
-            
-            # Pure data payload without redundant metadata
-            data_payload = data_extra if data_extra else {}
-            form.add_field('data', json.dumps(data_payload))
-
-            async with self._session.post(self.upload_url, data=form, timeout=30, ssl=False) as resp:
-                if 200 <= resp.status <= 299:
-                    print(f"[{dev_eui}] Successfully uploaded image to {self.upload_url}")
-                else:
-                    resp_text = await resp.text()
-                    print(f"[{dev_eui}] Upload failed ({resp.status}): {resp_text}")
-        except Exception as e:
-            print(f"[{dev_eui}] Upload exception: {e}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="EdgeEye Image Reassembler (Chirpstack v4 MQTT)")
@@ -460,8 +430,6 @@ if __name__ == '__main__':
     parser.add_argument("--mqtt_pass", help="MQTT password", required=False, default=None)
     parser.add_argument("--redis_url", help="Redis URL for context storage", required=True)
     parser.add_argument("--device_profile_id", help="Filter by Device Profile ID", required=True)
-    parser.add_argument("--upload_url", help="HTTP URL to upload reassembled images", required=False, default=None)
-    parser.add_argument("--upload_headers", help="JSON string of HTTP headers for upload", required=False, default=None)
     args = parser.parse_args()
 
     mqtt_info = {
@@ -469,26 +437,15 @@ if __name__ == '__main__':
         'user': args.mqtt_user.strip() if args.mqtt_user else None,
         'pass': args.mqtt_pass.strip() if args.mqtt_pass else None
     }
-    
-    upload_headers = {}
-    if args.upload_headers:
-        try:
-            upload_headers = json.loads(args.upload_headers)
-        except Exception as e:
-            print(f"Failed to parse upload_headers: {e}")
 
     print(f"EdgeEye Reassembler starting...")
     print(f"MQTT Broker: {mqtt_info['url']}")
     print(f"Filtering by Device Profile ID: {args.device_profile_id}")
-    if args.upload_url:
-        print(f"Upload enabled: {args.upload_url}")
     
     processor = ImageReassembler(
         mqtt_info, 
         args.redis_url.strip(), 
         args.device_profile_id.strip(),
-        upload_url=args.upload_url,
-        upload_headers=upload_headers
     )
     processor.start()
     processor.loop_forever()

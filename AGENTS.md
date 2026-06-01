@@ -5,9 +5,9 @@
 Two services communicate through **Redis** and receive LoRaWAN uplinks from Chirpstack v4 MQTT.
 
 | Service | Language | Entrypoint | Role |
-|---|---|---|---|
-| `edgeeye_reassembler` | Python 3 | `post-processor/EdgeEye.py` | Image fragment reassembly + HTTP upload |
-| `mjpeg_streamer` | Node.js (ESM) | `mjpeg-streamer/app.js` | MJPEG HTTP streaming server |
+|---|---|---|---|---|
+| `edgeeye_reassembler` | Python 3 | `post-processor/EdgeEye.py` | Image fragment reassembly |
+| `mjpeg_streamer` | Node.js (ESM) | `mjpeg-streamer/app.js` | MJPEG HTTP streaming + composite + HTTP upload |
 
 ## Run
 
@@ -25,6 +25,9 @@ Required `.env` keys: `MQTT_URL`, `REDIS_URL`, `DEVICE_PROFILE_ID`
 | `ImageToRtsp:{devEui}:image` | Current in-progress image |
 | `ImageToRtsp:{devEui}:image:last` | Last completed image |
 | `ImageToRtsp:{devEui}:sense_time` | Sensor timestamp |
+| `ImageToRtsp:{devEui}:det` | Latest detection data (set by Python on OBJDET) |
+| `ImageToRtsp:{devEui}:det:last` | Detection data for last completed image |
+| `ImageToRtsp:{devEui}:upload:ready` | Upload trigger metadata (set by Python, consumed by Node.js via GETDEL) |
 | `EdgeEye:updated:{devEui}` | Pub/Sub channel (reassembly done notification) |
 
 ## Ports
@@ -107,7 +110,7 @@ Adds up to 2 extra LoRaWAN sessions: Reassembly ID (5B) + Session0 DevAddr/NwkSK
 ## Build / Deploy
 
 - Docker build only. No local npm/pip test runners, linters, or type checkers.
-- `Dockerfile-reassembler` base: `python:3-alpine` (pip deps: redis, pillow, numpy, pyjwt, paho-mqtt, aiohttp)
+- `Dockerfile-reassembler` base: `python:3-alpine` (pip deps: redis, pillow, numpy, pyjwt, paho-mqtt)
 - `Dockerfile-streamer` base: `node:22-alpine` (npm deps: commander, sharp, redis)
 - MJPEG streamer requires `--experimental-json-modules` flag (in `package.json` `start` script)
 

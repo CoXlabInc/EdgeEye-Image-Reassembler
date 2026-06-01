@@ -15,11 +15,24 @@ program
     .description(pjson.description)
     .option('-r --redis <URL>', 'Redis URL (default redis://localhost)')
     .option('-p --port <n>', 'port number (default 8080)', parseInt)
+    .option('-u --upload-url <URL>', 'Upload URL for composed images')
+    .option('-H --upload-headers <JSON>', 'JSON string of HTTP headers for upload')
+    .option('-M --det-upload-mode <n>', 'Det upload mode (1=with snap, 2=det first+with snap, 3=det first+snap alone)', parseInt)
+    .option('-O --upload-overlay <items>', 'Upload snap overlay (comma-separated: timestamp,bbox,none)')
     .option('-v --version', 'show version')
     .parse(process.argv);
 
 const redisUrl = program.opts().redis || process.env.REDIS_URL || 'redis://localhost';
 const port = program.opts().port || 8080;
+const uploadUrl = program.opts().uploadUrl || process.env.UPLOAD_URL || '';
+const uploadHeaders = program.opts().uploadHeaders || process.env.UPLOAD_HEADERS || '';
+const detUploadMode = program.opts().detUploadMode || parseInt(process.env.DET_UPLOAD_MODE) || 2;
+const uploadOverlayStr = program.opts().uploadOverlay || process.env.UPLOAD_OVERLAY || 'timestamp,bbox';
+const overlayParts = uploadOverlayStr.toLowerCase().split(',').map(s => s.trim());
+const uploadOverlay = {
+    timestamp: overlayParts.includes('timestamp'),
+    bbox: overlayParts.includes('bbox') || overlayParts.includes('det'),
+};
 const boundaryID = "boundary_id";
 
 // Primary Redis client for data fetching
@@ -36,13 +49,61 @@ try {
     process.exit(1);
 }
 
-async function fetchAndSendImage(res, bufferKey, timestampKey, locale, timezone, height, mjpeg) {
+// Global subscriber for det uploads (independent of MJPEG connections)
+const globalSub = redisClient.duplicate();
+await globalSub.connect();
+await globalSub.pSubscribe('EdgeEye:updated:*', async (message, channel) => {
+    const device = channel.replace('EdgeEye:updated:', '');
+    if (message === "det") {
+        doUploadDet(device);
+    } else {
+        doUpload(device);
+    }
+});
+
+function buildComposites(metadata, timestampStr, detections, overlay = { timestamp: true, bbox: true }) {
+    const composites = [];
+    if (overlay.timestamp) {
+        const fontSize = Math.max(10, Math.floor(metadata.height * 0.09));
+        const timestampSvg = `<svg width="${metadata.width}" height="${fontSize + 8}" xmlns="http://www.w3.org/2000/svg">
+<text x="2" y="${fontSize}" fill="white" font-size="${fontSize}" font-family="monospace" stroke="black" stroke-width="0.5">${timestampStr}</text>
+</svg>`;
+        composites.push({
+            input: Buffer.from(timestampSvg),
+            top: 0,
+            left: 0
+        });
+    }
+    if (overlay.bbox && detections && detections.length > 0) {
+        const colors = ["#00ff00", "#ff0000", "#00ffff", "#ffff00", "#ff00ff", "#0000ff", "#ffffff"];
+        let svgParts = [`<svg width="${metadata.width}" height="${metadata.height}" xmlns="http://www.w3.org/2000/svg">`];
+        for (let k = 0; k < detections.length; k++) {
+            const d = detections[k];
+            const px = d.x * metadata.width;
+            const py = d.y * metadata.height;
+            const pw = d.w * metadata.width;
+            const ph = d.h * metadata.height;
+            const color = colors[k % colors.length];
+            const scorePct = Math.round(d.score * 100);
+            svgParts.push(`<rect x="${px - pw/2}" y="${py - ph/2}" width="${pw}" height="${ph}" stroke="${color}" stroke-width="2" fill="none"/>`);
+            svgParts.push(`<text x="${px - pw/2 + 2}" y="${py - ph/2 - 4}" fill="${color}" font-size="13" font-family="monospace">${d.class}(${scorePct}%)</text>`);
+        }
+        svgParts.push('</svg>');
+        composites.push({
+            input: Buffer.from(svgParts.join('')),
+            top: 0,
+            left: 0
+        });
+    }
+    return composites;
+}
+
+async function fetchAndSendImage(res, bufferKey, timestampKey, mjpeg, detKey) {
     if (res.writableEnded) return;
 
     let buffer = await redisClient.GET(redis.commandOptions({ returnBuffers: true }), bufferKey);
     
     if (!buffer || buffer.length === 0) {
-        // Fallback to last known good image
         buffer = await redisClient.GET(redis.commandOptions({ returnBuffers: true }), bufferKey + ':last');
     }
 
@@ -55,22 +116,17 @@ async function fetchAndSendImage(res, bufferKey, timestampKey, locale, timezone,
             let timestampStr = "Unknown";
             if (rawTimestamp) {
                 const date = new Date(rawTimestamp);
-                // Simple ISO 8601 string (UTC)
-                timestampStr = date.toISOString();
+                timestampStr = date.toLocaleString('sv-SE', { timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone });
             }
 
-            const processedBuffer = await image.composite([{
-                input: {
-                    text: {
-                        text: timestampStr,
-                        width: metadata.width,
-                        height: height,
-                        align: "left",
-                    }
-                },
-                top: 0,
-                left: 0
-            }]).jpeg().toBuffer();
+            let detections = null;
+            if (detKey) {
+                let rawDet = await redisClient.GET(detKey);
+                if (rawDet) detections = JSON.parse(rawDet);
+            }
+
+            const composites = buildComposites(metadata, timestampStr, detections);
+            const processedBuffer = await image.composite(composites).jpeg().toBuffer();
 
             if (mjpeg) {
                 res.write('Content-Type: image/jpeg\r\n');
@@ -90,6 +146,117 @@ async function fetchAndSendImage(res, bufferKey, timestampKey, locale, timezone,
     return 0;
 }
 
+async function postDetOnly(device, meta, senseTime) {
+    const body = { deviceId: device };
+
+    appendTimestamp(body, device, senseTime);
+
+    const dataPayload = {};
+    if (meta.system_voltage) dataPayload.system_voltage = meta.system_voltage;
+    if (meta.ambient_light_lux) dataPayload.ambient_light_lux = meta.ambient_light_lux;
+    if (meta.det) dataPayload.det = meta.det;
+    body.data = dataPayload;
+
+    console.log(`[${device}] Det body: ${JSON.stringify(body)}`);
+
+    const headers = uploadHeaders ? JSON.parse(uploadHeaders) : {};
+    headers['Content-Type'] = 'application/json';
+    const resp = await fetch(uploadUrl, { method: 'POST', headers, body: JSON.stringify(body) });
+    if (resp.ok) {
+        console.log(`[${device}] Det uploaded to ${uploadUrl}`);
+    } else {
+        const text = await resp.text();
+        console.error(`[${device}] Det upload failed (${resp.status}): ${text}`);
+    }
+}
+
+function appendTimestamp(target, device, senseTime) {
+    try {
+        const st = new Date(senseTime);
+        if (st instanceof Date && !isNaN(st)) {
+            if (st.getFullYear() >= 2020) {
+                if (typeof target.append === 'function') {
+                    target.append('_timestamp', senseTime);  // FormData
+                } else {
+                    target._timestamp = senseTime;  // plain object
+                }
+            } else {
+                console.log(`[${device}] Skipping _timestamp: year ${st.getFullYear()} is too far in the past`);
+            }
+        } else {
+            console.log(`[${device}] Skipping _timestamp: failed to parse '${senseTime}'`);
+        }
+    } catch (e) {
+        console.log(`[${device}] Skipping _timestamp: ${e.message}`);
+    }
+}
+
+async function postComposite(device, meta, senseTime, includeDet, overlay) {
+    const [jpegBuffer, detRaw] = await Promise.all([
+        redisClient.GET(redis.commandOptions({ returnBuffers: true }), `ImageToRtsp:${device}:image:last`),
+        redisClient.GET(`ImageToRtsp:${device}:det:last`),
+    ]);
+    if (!jpegBuffer) return;
+
+    const detections = includeDet && overlay.bbox && detRaw ? JSON.parse(detRaw) : null;
+
+    const image = sharp(jpegBuffer, { failOn: 'none' });
+    const metadata = await image.metadata();
+    const date = new Date(senseTime);
+    const timestampStr = date.toLocaleString('sv-SE', { timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone });
+    const composites = buildComposites(metadata, timestampStr, detections, overlay);
+    const composed = await image.composite(composites).jpeg().toBuffer();
+
+    const dataPayload = {};
+    if (meta.system_voltage) dataPayload.system_voltage = meta.system_voltage;
+    if (meta.ambient_light_lux) dataPayload.ambient_light_lux = meta.ambient_light_lux;
+    if (includeDet && meta.det) dataPayload.det = meta.det;
+
+    const form = new FormData();
+    form.append('snap', new Blob([composed]), 'image.jpg');
+    form.append('deviceId', device);
+    appendTimestamp(form, device, senseTime);
+    form.append('data', JSON.stringify(dataPayload));
+    console.log(`[${device}] Composite data payload: ${JSON.stringify({...dataPayload, _timestamp: senseTime})}`);
+
+    const headers = uploadHeaders ? JSON.parse(uploadHeaders) : {};
+    const resp = await fetch(uploadUrl, { method: 'POST', headers, body: form });
+    if (resp.ok) {
+        console.log(`[${device}] Composite uploaded to ${uploadUrl}`);
+    } else {
+        const text = await resp.text();
+        console.error(`[${device}] Composite upload failed (${resp.status}): ${text}`);
+    }
+}
+
+async function doUploadDet(device) {
+    if (!uploadUrl || detUploadMode < 2) return;
+    const detRaw = await redisClient.GET(`ImageToRtsp:${device}:det`);
+    if (!detRaw) return;
+    const det = JSON.parse(detRaw);
+    if (!det.length) return;
+
+    const meta = { det };
+    const senseTime = await redisClient.GET(`ImageToRtsp:${device}:sense_time`);
+    await postDetOnly(device, meta, senseTime || "Unknown");
+}
+
+async function doUpload(device) {
+    if (!uploadUrl) return;
+    const metaRaw = await redisClient.getDel(`ImageToRtsp:${device}:upload:ready`);
+    if (!metaRaw) return;
+    const meta = JSON.parse(metaRaw);
+    const senseTime = meta.sense_time || "Unknown";
+    console.log(`[${device}] Upload triggered (mode=${detUploadMode}, overlay=${uploadOverlayStr})`);
+
+    try {
+        const includeDet = detUploadMode !== 3;
+        await postComposite(device, meta, senseTime, includeDet, uploadOverlay);
+    } catch (e) {
+        console.error(`[${device}] Upload error: ${e.message}`);
+    }
+}
+
 /**
  * create a server to serve out the motion jpeg images
  */
@@ -104,16 +271,15 @@ var server = http.createServer(async (req, res) => {
         
         let bufferKey = `ImageToRtsp:${device}:image`;
         let timestampKey = `ImageToRtsp:${device}:sense_time`;
+        let detKey = params.get('det') === 'true' ? `ImageToRtsp:${device}:det` : null;
 
         if (isLastRequest) {
             bufferKey += ':last';
             timestampKey += ':last';
+            if (detKey) detKey += ':last';
         }
 
         let mjpeg = params.get('mjpeg') !== 'false';
-        let locale = params.get('locale') || Intl.DateTimeFormat().resolvedOptions().locale;
-        let timezone = params.get('timezone') || Intl.DateTimeFormat().resolvedOptions().timeZone;
-        let height = parseInt(params.get('height')) || 30;
 
         if (mjpeg) {
             res.writeHead(200, {
@@ -125,7 +291,7 @@ var server = http.createServer(async (req, res) => {
             res.write('--' + boundaryID + '\r\n');
 
             // Send initial frame
-            await fetchAndSendImage(res, bufferKey, timestampKey, locale, timezone, height, true);
+            await fetchAndSendImage(res, bufferKey, timestampKey, true, detKey);
 
             // Setup Pub/Sub for live updates
             const subscriber = redisClient.duplicate();
@@ -136,7 +302,7 @@ var server = http.createServer(async (req, res) => {
 
             const sendHeartbeat = async () => {
                 if (res.writableEnded) return;
-                const size = await fetchAndSendImage(res, bufferKey, timestampKey, locale, timezone, height, true);
+                const size = await fetchAndSendImage(res, bufferKey, timestampKey, true, detKey);
                 console.log(`[${device}] Heartbeat frame sent: ${size} bytes`);
                 resetHeartbeat();
             };
@@ -147,9 +313,14 @@ var server = http.createServer(async (req, res) => {
             };
 
             await subscriber.subscribe(updateChannel, async (message) => {
-                const size = await fetchAndSendImage(res, bufferKey, timestampKey, locale, timezone, height, true);
-                console.log(`[${device}] Updated frame sent: ${size} bytes`);
-                resetHeartbeat();
+                if (message === "det") {
+                    doUploadDet(device);
+                } else {
+                    const size = await fetchAndSendImage(res, bufferKey, timestampKey, true, detKey);
+                    console.log(`[${device}] Updated frame sent: ${size} bytes`);
+                    resetHeartbeat();
+                    doUpload(device);
+                }
             });
 
             resetHeartbeat();
@@ -163,7 +334,7 @@ var server = http.createServer(async (req, res) => {
 
         } else {
             // Single image request
-            await fetchAndSendImage(res, bufferKey, timestampKey, locale, timezone, height, false);
+            await fetchAndSendImage(res, bufferKey, timestampKey, false, detKey);
         }
     } else if (req.url === "/healthcheck") {
         res.statusCode = 200;
