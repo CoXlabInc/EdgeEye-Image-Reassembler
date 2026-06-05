@@ -283,6 +283,7 @@ class ImageReassembler:
         elif epoch > active_epoch:
             print(f"[{dev_eui}] New image detected: 0x{epoch:08X} (replacing 0x{active_epoch:08X})")
             await r.set(active_epoch_key, epoch, ex=86400)
+            await r.delete(f"ImageToRtsp:{dev_eui}:det")
 
         # Removed: if len(frag_data) == 0 and not first_frag: return
         
@@ -405,6 +406,8 @@ class ImageReassembler:
                 await r.set(f"{rtsp_base}:sense_time:last", sense_time, ex=86400)
                 if 'det' in state:
                     await r.set(f"{rtsp_base}:det:last", json.dumps(state['det']), ex=86400)
+                else:
+                    await r.delete(f"{rtsp_base}:det:last")
                 await r.set(completed_key, 1, ex=86400)
                 await self._send_downlink(app_id, dev_eui, 4, epoch.to_bytes(5, 'little'))
                 await r.delete(buffer_key)
