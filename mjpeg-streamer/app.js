@@ -2,6 +2,8 @@
 
 import os from 'os';
 import http from 'http';
+import fs from 'fs/promises';
+import path from 'path';
 import sharp from 'sharp';
 
 import { Command } from 'commander';
@@ -19,6 +21,7 @@ program
     .option('-H --upload-headers <JSON>', 'JSON string of HTTP headers for upload')
     .option('-M --det-upload-mode <n>', 'Det upload mode (1=with snap, 2=det first+with snap, 3=det first+snap alone)', parseInt)
     .option('-O --upload-overlay <items>', 'Upload snap overlay (comma-separated: timestamp,bbox,none)')
+    .option('-s --save-dir <path>', 'Save directory for completed images (default empty = disabled)')
     .option('-v --version', 'show version')
     .parse(process.argv);
 
@@ -33,7 +36,9 @@ const uploadOverlay = {
     timestamp: overlayParts.includes('timestamp'),
     bbox: overlayParts.includes('bbox') || overlayParts.includes('det'),
 };
+const saveDir = program.opts().saveDir || process.env.SAVE_DIR || '';
 const boundaryID = "boundary_id";
+const HEX16_RE = /^[a-f0-9]{16}$/;
 
 // Primary Redis client for data fetching
 var redisClient = redis.createClient({
@@ -241,13 +246,46 @@ async function doUploadDet(device) {
     await postDetOnly(device, meta, senseTime || "Unknown");
 }
 
+async function saveImages(device, senseTime, hasDet) {
+    if (!saveDir) return;
+    const jpegBuffer = await redisClient.GET(
+        redis.commandOptions({ returnBuffers: true }),
+        `ImageToRtsp:${device}:image:last`
+    );
+    if (!jpegBuffer) return;
+
+    const ts = new Date(senseTime).toISOString().replace(/[:.]/g, '-');
+    const filepath = path.join(saveDir, `${device}_${ts}_det.jpg`);
+
+    if (hasDet && uploadOverlay.bbox) {
+        const detRaw = await redisClient.GET(`ImageToRtsp:${device}:det:last`);
+        const detections = detRaw ? JSON.parse(detRaw) : null;
+        const image = sharp(jpegBuffer, { failOn: 'none' });
+        const metadata = await image.metadata();
+        const timestampStr = new Date(senseTime).toLocaleString('sv-SE', {
+            timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone
+        });
+        const composites = buildComposites(metadata, timestampStr, detections, uploadOverlay);
+        const composed = await image.composite(composites).jpeg().toBuffer();
+        await fs.writeFile(filepath, composed);
+    } else {
+        await fs.writeFile(filepath, jpegBuffer);
+    }
+    console.log(`[${device}] Saved ${filepath}`);
+}
+
 async function doUpload(device) {
     if (!uploadUrl) return;
     const metaRaw = await redisClient.getDel(`ImageToRtsp:${device}:upload:ready`);
     if (!metaRaw) return;
     const meta = JSON.parse(metaRaw);
     const senseTime = meta.sense_time || "Unknown";
+    const hasDet = meta.det && meta.det.length > 0;
     console.log(`[${device}] Upload triggered (mode=${detUploadMode}, overlay=${uploadOverlayStr})`);
+
+    await saveImages(device, senseTime, hasDet).catch(e =>
+        console.error(`[${device}] Save failed: ${e.message}`)
+    );
 
     try {
         const includeDet = detUploadMode !== 3;
@@ -267,6 +305,18 @@ var server = http.createServer(async (req, res) => {
     
     if (path.length >= 1 && path[0] !== 'healthcheck' && path[0] !== '') {
         const device = path[0].toLowerCase();
+        if (!HEX16_RE.test(device)) {
+            res.statusCode = 400;
+            res.end('Invalid device EUI');
+            return;
+        }
+        const exists = await redisClient.EXISTS(`ImageToRtsp:${device}:image`);
+        const lastExists = await redisClient.EXISTS(`ImageToRtsp:${device}:image:last`);
+        if (!exists && !lastExists) {
+            res.statusCode = 404;
+            res.end('Device not found');
+            return;
+        }
         const isLastRequest = path.length === 2 && path[1] === 'last';
         
         let bufferKey = `ImageToRtsp:${device}:image`;
@@ -336,9 +386,6 @@ var server = http.createServer(async (req, res) => {
             // Single image request
             await fetchAndSendImage(res, bufferKey, timestampKey, false, detKey);
         }
-    } else if (req.url === "/healthcheck") {
-        res.statusCode = 200;
-        res.end();
     } else {
         res.statusCode = 404;
         res.end('Not Found');

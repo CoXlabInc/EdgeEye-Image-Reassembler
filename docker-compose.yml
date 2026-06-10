@@ -21,7 +21,10 @@ services:
       - LANG=${LANG:-en_US.UTF-8}
       - UPLOAD_URL=${UPLOAD_URL:-}
       - UPLOAD_HEADERS=${UPLOAD_HEADERS:-}
-    command: npm start -- -r ${REDIS_URL:-redis://redis} -u ${UPLOAD_URL:-} -M ${DET_UPLOAD_MODE:-2} -O ${UPLOAD_OVERLAY:-timestamp,bbox}
+      - SAVE_DIR=${SAVE_DIR:+/data/${SAVE_DIR}}
+    volumes:
+      - ./${SAVE_DIR:-saved_images}:/data/${SAVE_DIR:-saved_images}
+    command: npm start -- -r ${REDIS_URL:-redis://redis} -u ${UPLOAD_URL:-} -M ${DET_UPLOAD_MODE:-2} -O ${UPLOAD_OVERLAY:-timestamp,bbox} ${SAVE_DIR:+-s /data/${SAVE_DIR}}
 
   edgeeye_reassembler:
     container_name: edgeeye_reassembler

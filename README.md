@@ -58,9 +58,43 @@ Services:
 
 ## Usage
 
-### MJPEG Streaming
-- **Live Reassembly**: `http://[SERVER_IP]:8083/[DevEUI]` (with `?det=true` for bbox overlay)
-- **Last Completed**: `http://[SERVER_IP]:8083/[DevEUI]/last` (also supports `?det=true`)
+### HTTP API
+
+MJPEG streamer is built on raw `http.createServer` and handles all HTTP methods (GET, POST, etc.) the same way.
+
+| Endpoint | Description |
+|---|---|
+| `GET /{devEui}` | Live reassembly image streaming / snapshot |
+| `GET /{devEui}/last` | Last completed image streaming / snapshot |
+
+**Query Parameters:**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `mjpeg` | `"true"` / `"false"` | `"true"` | Returns a single JPEG instead of MJPEG stream |
+| `det` | `"true"` / omitted | omitted | Enables detection bbox overlay |
+
+**Examples:**
+
+| URL | Description |
+|---|---|
+| `http://host:8083/{devEui}` | MJPEG live streaming |
+| `http://host:8083/{devEui}?mjpeg=false` | Single JPEG of in-progress image |
+| `http://host:8083/{devEui}?det=true` | MJPEG + bbox overlay |
+| `http://host:8083/{devEui}?mjpeg=false&det=true` | Single JPEG + bbox overlay |
+| `http://host:8083/{devEui}/last` | Last completed image MJPEG stream |
+| `http://host:8083/{devEui}/last?mjpeg=false` | Last completed image as JPEG |
+| `http://host:8083/{devEui}/last?det=true` | Last completed MJPEG + bbox |
+
+**Validation:**
+
+| Condition | Response |
+|---|---|
+| `{devEui}` is not a 16-character hex string | `400 Invalid device EUI` |
+| No available image for `{devEui}` | `404 Device not found` |
+| Undefined route | `404 Not Found` |
+
+**Port:** `8080` (container). See `docker-compose.yml` for host mapping.
 
 ### Automatic Upload
 If `UPLOAD_URL` is set, the system performs a `multipart/form-data` POST request when reassembly is complete. The uploaded `snap` is a composed JPEG with timestamp overlay (and bbox overlay if available).
