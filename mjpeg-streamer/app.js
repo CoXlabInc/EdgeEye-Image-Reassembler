@@ -295,6 +295,170 @@ async function doUpload(device) {
     }
 }
 
+async function gatherDeviceData() {
+    const deviceSet = new Set();
+    let cursor = 0;
+    do {
+        const reply = await redisClient.SCAN(cursor, { MATCH: 'ImageToRtsp:*:sense_time', TYPE: 'string' });
+        cursor = reply.cursor;
+        for (const key of reply.keys) {
+            const m = key.match(/^ImageToRtsp:([a-f0-9]+):sense_time$/);
+            if (m) deviceSet.add(m[1]);
+        }
+    } while (cursor !== 0);
+
+    const rows = (await Promise.all([...deviceSet].map(async (devEui) => {
+        const [senseTime, hasImage, hasLast, activeEpoch] = await Promise.all([
+            redisClient.GET(`ImageToRtsp:${devEui}:sense_time`),
+            redisClient.EXISTS(`ImageToRtsp:${devEui}:image`),
+            redisClient.EXISTS(`ImageToRtsp:${devEui}:image:last`),
+            redisClient.GET(`PP:EdgeEye:active_epoch:${devEui}`),
+        ]);
+
+        let progress = null;
+        if (activeEpoch) {
+            const stateRaw = await redisClient.GET(`PP:EdgeEye:state:${devEui}:${activeEpoch}`);
+            if (stateRaw) {
+                try {
+                    const st = JSON.parse(stateRaw);
+                    if (st.total_size > 0) progress = Math.min(100, Math.round((st.received / st.total_size) * 100));
+                } catch (_) {}
+            }
+        }
+        return { devEui, senseTime, hasImage: !!hasImage, hasLast: !!hasLast, progress };
+    }))).sort((a, b) => (b.senseTime || '').localeCompare(a.senseTime || ''));
+    return rows;
+}
+
+async function handleRoot(res) {
+    const rows = await gatherDeviceData();
+
+    const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
+    let html = `<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>EdgeEye Image Reassembler</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:20px;background:#fafafa}
+h1{color:#333;font-weight:500}
+table{border-collapse:collapse;width:100%;max-width:1000px;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.1);border-radius:4px}
+th,td{text-align:left;padding:10px 14px;border-bottom:1px solid #eee}
+th{background:#f5f5f5;font-weight:600;color:#555}
+tr:hover{background:#f9f9f9}
+.eui{font-family:monospace;font-size:.9em}
+.progress-bar{background:#e0e0e0;border-radius:4px;height:14px;width:120px;display:inline-block;vertical-align:middle}
+.progress-fill{background:#4caf50;height:14px;border-radius:4px}
+.check{color:#4caf50;font-weight:bold}
+.muted{color:#bbb}
+a{color:#1976d2;text-decoration:none;margin-right:8px}
+a:hover{text-decoration:underline}
+.overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.85);z-index:1000}
+.overlay img{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);max-width:95vw;max-height:95vh;border-radius:4px;box-shadow:0 4px 20px rgba(0,0,0,.5)}
+.overlay .close{position:absolute;top:16px;right:24px;color:#fff;font-size:36px;cursor:pointer;line-height:1;font-weight:bold}
+</style></head><body>
+<h1>EdgeEye Image Reassembler</h1>
+<table id="devices"><thead><tr><th>DevEUI</th><th>Last Activity</th><th>In-progress</th><th>Completed</th><th>Reassembly</th><th>View</th></tr></thead><tbody>`;
+
+    html += buildRows(rows, esc);
+
+    html += `</tbody></table>
+
+<div id="popup" class="overlay" onclick="closePopup()">
+  <span class="close">&times;</span>
+  <img id="popupImg" src="" alt="">
+</div>
+
+<script>
+function showPopup(url){
+  document.getElementById('popupImg').src=url;
+  document.getElementById('popup').style.display='block';
+}
+function closePopup(){
+  document.getElementById('popupImg').src='';
+  document.getElementById('popup').style.display='none';
+}
+(function(){
+var es=new EventSource('/stream');
+es.onmessage=function(e){
+  try{var rows=JSON.parse(e.data);
+  var tb=document.querySelector('#devices tbody');
+  if(tb)tb.innerHTML=${buildRowsScript};
+  }catch(x){}
+};
+es.onerror=function(){var t=setTimeout(function(){es.close()},3e4)};
+})();
+</script>
+</body></html>`;
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(html);
+}
+
+// Reusable row builder — used by both SSR and SSE
+function buildRows(rows, esc) {
+    if (rows.length === 0) {
+        return '<tr><td colspan="6" style="text-align:center;color:#999;padding:24px">No devices found</td></tr>';
+    }
+    let html = '';
+    for (const r of rows) {
+        const pct = r.progress !== null
+            ? '<div class="progress-bar"><div class="progress-fill" style="width:' + r.progress + '%"></div></div> ' + r.progress + '%'
+            : '<span class="muted">&mdash;</span>';
+        const ts = r.senseTime ? esc(r.senseTime) : '<span class="muted">&mdash;</span>';
+        html += '<tr>\n<td class="eui">' + r.devEui + '</td>\n' +
+            '<td>' + ts + '</td>\n' +
+            '<td>' + (r.hasImage ? '<span class="check">&#10003;</span>' : '<span class="muted">&mdash;</span>') + '</td>\n' +
+            '<td>' + (r.hasLast ? '<span class="check">&#10003;</span>' : '<span class="muted">&mdash;</span>') + '</td>\n' +
+            '<td>' + pct + '</td>\n' +
+            '<td><a href="#" onclick="showPopup(this.dataset.url)" data-url="/' + r.devEui + '">Live</a><a href="#" onclick="showPopup(this.dataset.url)" data-url="/' + r.devEui + '/last">Last</a></td>\n' +
+            '</tr>';
+    }
+    return html;
+}
+
+// SSE row builder as a string of JS (used inline in <script>)
+const buildRowsScript = 'rows.map(function(r){return\'<tr>\\n<td class="eui">\'+r.devEui+\'</td>\\n<td>\'+(r.senseTime?r.senseTime:\'<span class="muted">&mdash;</span>\')+\'</td>\\n<td>\'+(r.hasImage?\'<span class="check">&#10003;</span>\':\'<span class="muted">&mdash;</span>\')+\'</td>\\n<td>\'+(r.hasLast?\'<span class="check">&#10003;</span>\':\'<span class="muted">&mdash;</span>\')+\'</td>\\n<td>\'+(r.progress!==null?\'<div class="progress-bar"><div class="progress-fill" style="width:\'+r.progress+\'%"></div></div> \'+r.progress+\'%\':\'<span class="muted">&mdash;</span>\')+\'</td>\\n<td><a href=\"#\" onclick=\"showPopup(this.dataset.url)\" data-url=\"/\'+r.devEui+\'\">Live</a><a href=\"#\" onclick=\"showPopup(this.dataset.url)\" data-url=\"/\'+r.devEui+\'/last\">Last</a></td>\\n</tr>\'}).join(\'\\n\')';
+
+async function handleStream(res) {
+    res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+    });
+    res.write('\n');
+
+    const subscriber = redisClient.duplicate();
+    await subscriber.connect();
+
+    const send = async () => {
+        if (res.writableEnded) return;
+        try {
+            const data = await gatherDeviceData();
+            res.write('data: ' + JSON.stringify(data) + '\n\n');
+        } catch (e) {
+            console.error('SSE send error:', e.message);
+        }
+    };
+
+    await send();
+
+    await subscriber.pSubscribe('EdgeEye:updated:*', async () => {
+        await send();
+    });
+
+    const heartbeat = setInterval(() => {
+        if (res.writableEnded) { clearInterval(heartbeat); return; }
+        res.write(': hb\n\n');
+    }, 30000);
+
+    res.on('close', async () => {
+        clearInterval(heartbeat);
+        try {
+            await subscriber.pUnsubscribe();
+            await subscriber.disconnect();
+        } catch (_) {}
+    });
+}
+
 /**
  * create a server to serve out the motion jpeg images
  */
@@ -303,7 +467,11 @@ var server = http.createServer(async (req, res) => {
     let path = uri[0].split('/').slice(1);
     let params = new URLSearchParams(uri[1]);
     
-    if (path.length >= 1 && path[0] !== 'healthcheck' && path[0] !== '') {
+    if (path.length === 0 || (path.length === 1 && path[0] === '')) {
+        await handleRoot(res);
+    } else if (path.length === 1 && path[0] === 'stream') {
+        await handleStream(res);
+    } else if (path.length >= 1 && path[0] !== 'healthcheck' && path[0] !== '') {
         const device = path[0].toLowerCase();
         if (!HEX16_RE.test(device)) {
             res.statusCode = 400;
