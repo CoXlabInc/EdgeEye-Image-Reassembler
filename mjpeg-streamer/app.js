@@ -357,7 +357,7 @@ a:hover{text-decoration:underline}
 .overlay .close{position:absolute;top:16px;right:24px;color:#fff;font-size:36px;cursor:pointer;line-height:1;font-weight:bold}
 </style></head><body>
 <h1>EdgeEye Image Reassembler</h1>
-<table id="devices"><thead><tr><th>DevEUI</th><th>Last Activity</th><th>In-progress</th><th>Completed</th><th>Reassembly</th><th>View</th></tr></thead><tbody>`;
+<table id="devices"><thead><tr><th>DevEUI</th><th>Last Activity</th><th>Reassembly</th><th>View</th></tr></thead><tbody>`;
 
     html += buildRows(rows, esc);
 
@@ -380,9 +380,9 @@ function closePopup(){
 (function(){
 var es=new EventSource('/stream');
 es.onmessage=function(e){
-  try{var rows=JSON.parse(e.data);
+  try{var d=JSON.parse(e.data);
   var tb=document.querySelector('#devices tbody');
-  if(tb)tb.innerHTML=${buildRowsScript};
+  if(tb)tb.innerHTML=d.html;
   }catch(x){}
 };
 es.onerror=function(){var t=setTimeout(function(){es.close()},3e4)};
@@ -396,7 +396,7 @@ es.onerror=function(){var t=setTimeout(function(){es.close()},3e4)};
 // Reusable row builder — used by both SSR and SSE
 function buildRows(rows, esc) {
     if (rows.length === 0) {
-        return '<tr><td colspan="6" style="text-align:center;color:#999;padding:24px">No devices found</td></tr>';
+        return '<tr><td colspan="4" style="text-align:center;color:#999;padding:24px">No devices found</td></tr>';
     }
     let html = '';
     for (const r of rows) {
@@ -406,17 +406,12 @@ function buildRows(rows, esc) {
         const ts = r.senseTime ? esc(r.senseTime) : '<span class="muted">&mdash;</span>';
         html += '<tr>\n<td class="eui">' + r.devEui + '</td>\n' +
             '<td>' + ts + '</td>\n' +
-            '<td>' + (r.hasImage ? '<span class="check">&#10003;</span>' : '<span class="muted">&mdash;</span>') + '</td>\n' +
-            '<td>' + (r.hasLast ? '<span class="check">&#10003;</span>' : '<span class="muted">&mdash;</span>') + '</td>\n' +
             '<td>' + pct + '</td>\n' +
             '<td><a href="#" onclick="showPopup(this.dataset.url)" data-url="/' + r.devEui + '">Live</a><a href="#" onclick="showPopup(this.dataset.url)" data-url="/' + r.devEui + '/last">Last</a></td>\n' +
             '</tr>';
     }
     return html;
 }
-
-// SSE row builder as a string of JS (used inline in <script>)
-const buildRowsScript = 'rows.map(function(r){return\'<tr>\\n<td class="eui">\'+r.devEui+\'</td>\\n<td>\'+(r.senseTime?r.senseTime:\'<span class="muted">&mdash;</span>\')+\'</td>\\n<td>\'+(r.hasImage?\'<span class="check">&#10003;</span>\':\'<span class="muted">&mdash;</span>\')+\'</td>\\n<td>\'+(r.hasLast?\'<span class="check">&#10003;</span>\':\'<span class="muted">&mdash;</span>\')+\'</td>\\n<td>\'+(r.progress!==null?\'<div class="progress-bar"><div class="progress-fill" style="width:\'+r.progress+\'%"></div></div> \'+r.progress+\'%\':\'<span class="muted">&mdash;</span>\')+\'</td>\\n<td><a href=\"#\" onclick=\"showPopup(this.dataset.url)\" data-url=\"/\'+r.devEui+\'\">Live</a><a href=\"#\" onclick=\"showPopup(this.dataset.url)\" data-url=\"/\'+r.devEui+\'/last\">Last</a></td>\\n</tr>\'}).join(\'\\n\')';
 
 async function handleStream(res) {
     res.writeHead(200, {
@@ -429,11 +424,14 @@ async function handleStream(res) {
     const subscriber = redisClient.duplicate();
     await subscriber.connect();
 
+    const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
     const send = async () => {
         if (res.writableEnded) return;
         try {
             const data = await gatherDeviceData();
-            res.write('data: ' + JSON.stringify(data) + '\n\n');
+            const html = buildRows(data, esc);
+            res.write('data: ' + JSON.stringify({ html }) + '\n\n');
         } catch (e) {
             console.error('SSE send error:', e.message);
         }
