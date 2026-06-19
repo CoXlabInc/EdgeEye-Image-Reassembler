@@ -266,6 +266,7 @@ class ImageReassembler:
             await r.set(state_key, json.dumps(state), ex=3600)
             await r.set(f"ImageToRtsp:{dev_eui}:det", json.dumps(det), ex=86400)
             await r.set(f"ImageToRtsp:{dev_eui}:sense_time", sense_time, ex=86400)
+            await r.set(f"ImageToRtsp:{dev_eui}:app_id", app_id, ex=86400)
             await r.publish(f"EdgeEye:updated:{dev_eui}", "det")
             print(f"[{dev_eui}:{sense_time}] Object detection: {obj_count} objects (Epoch: 0x{epoch:08X})")
             return
@@ -415,6 +416,7 @@ class ImageReassembler:
                 
                 # Notify Node.js streamer to perform composite + upload
                 upload_meta = {
+                    'app_id': app_id,
                     'sense_time': sense_time,
                     'system_voltage': state.get('system_voltage'),
                     'ambient_light_lux': state.get('ambient_light_lux'),

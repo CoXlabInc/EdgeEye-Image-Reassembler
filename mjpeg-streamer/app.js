@@ -37,6 +37,26 @@ const uploadOverlay = {
     bbox: overlayParts.includes('bbox') || overlayParts.includes('det'),
 };
 const saveDir = program.opts().saveDir || process.env.SAVE_DIR || '';
+const appUploadConfigs = process.env.APP_UPLOAD ? JSON.parse(process.env.APP_UPLOAD) : {};
+
+function resolveAppConfig(appId) {
+    return (appId && appUploadConfigs[appId]) || null;
+}
+
+function getUploadUrl(appId) {
+    const cfg = resolveAppConfig(appId);
+    return cfg?.url || uploadUrl;
+}
+
+function getUploadHeaders(appId) {
+    const cfg = resolveAppConfig(appId);
+    return cfg?.headers ? JSON.stringify(cfg.headers) : uploadHeaders;
+}
+
+function getSaveDir(appId) {
+    const cfg = resolveAppConfig(appId);
+    return cfg?.save_dir || saveDir;
+}
 const boundaryID = "boundary_id";
 const HEX16_RE = /^[a-f0-9]{16}$/;
 
@@ -151,7 +171,7 @@ async function fetchAndSendImage(res, bufferKey, timestampKey, mjpeg, detKey) {
     return 0;
 }
 
-async function postDetOnly(device, meta, senseTime) {
+async function postDetOnly(device, meta, senseTime, appId) {
     const body = { deviceId: device };
 
     appendTimestamp(body, device, senseTime);
@@ -164,11 +184,12 @@ async function postDetOnly(device, meta, senseTime) {
 
     console.log(`[${device}] Det body: ${JSON.stringify(body)}`);
 
-    const headers = uploadHeaders ? JSON.parse(uploadHeaders) : {};
+    const url = getUploadUrl(appId);
+    const headers = getUploadHeaders(appId) ? JSON.parse(getUploadHeaders(appId)) : {};
     headers['Content-Type'] = 'application/json';
-    const resp = await fetch(uploadUrl, { method: 'POST', headers, body: JSON.stringify(body) });
+    const resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
     if (resp.ok) {
-        console.log(`[${device}] Det uploaded to ${uploadUrl}`);
+        console.log(`[${device}] Det uploaded to ${url}`);
     } else {
         const text = await resp.text();
         console.error(`[${device}] Det upload failed (${resp.status}): ${text}`);
@@ -203,6 +224,7 @@ async function postComposite(device, meta, senseTime, includeDet, overlay) {
     ]);
     if (!jpegBuffer) return;
 
+    const appId = meta.app_id;
     const detections = includeDet && overlay.bbox && detRaw ? JSON.parse(detRaw) : null;
 
     const image = sharp(jpegBuffer, { failOn: 'none' });
@@ -224,10 +246,11 @@ async function postComposite(device, meta, senseTime, includeDet, overlay) {
     form.append('data', JSON.stringify(dataPayload));
     console.log(`[${device}] Composite data payload: ${JSON.stringify({...dataPayload, _timestamp: senseTime})}`);
 
-    const headers = uploadHeaders ? JSON.parse(uploadHeaders) : {};
-    const resp = await fetch(uploadUrl, { method: 'POST', headers, body: form });
+    const url = getUploadUrl(appId);
+    const headers = getUploadHeaders(appId) ? JSON.parse(getUploadHeaders(appId)) : {};
+    const resp = await fetch(url, { method: 'POST', headers, body: form });
     if (resp.ok) {
-        console.log(`[${device}] Composite uploaded to ${uploadUrl}`);
+        console.log(`[${device}] Composite uploaded to ${url}`);
     } else {
         const text = await resp.text();
         console.error(`[${device}] Composite upload failed (${resp.status}): ${text}`);
@@ -235,19 +258,25 @@ async function postComposite(device, meta, senseTime, includeDet, overlay) {
 }
 
 async function doUploadDet(device) {
-    if (!uploadUrl || detUploadMode < 2) return;
-    const detRaw = await redisClient.GET(`ImageToRtsp:${device}:det`);
+    if (detUploadMode < 2) return;
+    const [detRaw, appId, senseTime] = await Promise.all([
+        redisClient.GET(`ImageToRtsp:${device}:det`),
+        redisClient.GET(`ImageToRtsp:${device}:app_id`),
+        redisClient.GET(`ImageToRtsp:${device}:sense_time`),
+    ]);
     if (!detRaw) return;
     const det = JSON.parse(detRaw);
     if (!det.length) return;
+    const url = getUploadUrl(appId);
+    if (!url) return;
 
-    const meta = { det };
-    const senseTime = await redisClient.GET(`ImageToRtsp:${device}:sense_time`);
-    await postDetOnly(device, meta, senseTime || "Unknown");
+    const meta = { det, app_id: appId };
+    await postDetOnly(device, meta, senseTime || "Unknown", appId);
 }
 
-async function saveImages(device, senseTime, hasDet) {
-    if (!saveDir) return;
+async function saveImages(device, senseTime, hasDet, appId) {
+    const dir = getSaveDir(appId);
+    if (!dir) return;
     const jpegBuffer = await redisClient.GET(
         redis.commandOptions({ returnBuffers: true }),
         `ImageToRtsp:${device}:image:last`
@@ -255,7 +284,7 @@ async function saveImages(device, senseTime, hasDet) {
     if (!jpegBuffer) return;
 
     const ts = new Date(senseTime).toISOString().replace(/[:.]/g, '-');
-    const filepath = path.join(saveDir, `${device}_${ts}_det.jpg`);
+    const filepath = path.join(dir, `${device}_${ts}_det.jpg`);
 
     if (hasDet && uploadOverlay.bbox) {
         const detRaw = await redisClient.GET(`ImageToRtsp:${device}:det:last`);
@@ -275,15 +304,16 @@ async function saveImages(device, senseTime, hasDet) {
 }
 
 async function doUpload(device) {
-    if (!uploadUrl) return;
     const metaRaw = await redisClient.getDel(`ImageToRtsp:${device}:upload:ready`);
     if (!metaRaw) return;
     const meta = JSON.parse(metaRaw);
+    const appId = meta.app_id;
+    if (!getUploadUrl(appId)) return;
     const senseTime = meta.sense_time || "Unknown";
     const hasDet = meta.det && meta.det.length > 0;
-    console.log(`[${device}] Upload triggered (mode=${detUploadMode}, overlay=${uploadOverlayStr})`);
+    console.log(`[${device}] Upload triggered (app=${appId}, mode=${detUploadMode}, overlay=${uploadOverlayStr})`);
 
-    await saveImages(device, senseTime, hasDet).catch(e =>
+    await saveImages(device, senseTime, hasDet, appId).catch(e =>
         console.error(`[${device}] Save failed: ${e.message}`)
     );
 
