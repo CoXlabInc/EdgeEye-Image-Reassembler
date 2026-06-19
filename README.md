@@ -40,6 +40,7 @@ This project is a reference bridge for integrating [EdgeEye](https://www.coxlab.
    - `UPLOAD_HEADERS`: (Optional) JSON string of HTTP headers for uploads (e.g., `{"X-API-Key": "your-token"}`).
    - `DET_UPLOAD_MODE`: (Optional) How to upload object detection data. `1`=included with snap, `2`=det first then snap (default), `3`=det first then snap alone (without det).
    - `UPLOAD_OVERLAY`: (Optional) Comma-separated overlay types for the upload snap. `timestamp,bbox` (default) includes both; `timestamp` for timestamp only; `bbox` for bbox only; `none` for raw JPEG.
+   - `SAVE_DIR`: (Optional) Directory name for saving completed images to disk. Host path: `./{SAVE_DIR}`, container path: `/data/{SAVE_DIR}`. Leave empty to disable.
    - `TZ`: Local timezone (e.g., `Asia/Seoul`).
    - `LANG`: Locale (e.g., `ko_KR.UTF-8`).
 
@@ -63,18 +64,30 @@ Services:
 MJPEG streamer is built on raw `http.createServer` and handles all HTTP methods (GET, POST, etc.) the same way.
 
 | Endpoint | Description |
-|---|---|
+|---|---|---|
+| `GET /` | Device dashboard with live device list, progress, and in-page popup viewer |
 | `GET /{devEui}` | Live reassembly image streaming / snapshot |
 | `GET /{devEui}/last` | Last completed image streaming / snapshot |
 
-**Query Parameters:**
+**Device Dashboard:**
+
+The root endpoint (`/`) displays all known devices with their status in a table. Clicking **Live** or **Last** opens a dark overlay popup for MJPEG streaming directly on the page.
+
+| Column | Description |
+|---|---|
+| DevEUI | 16-character hex device identifier |
+| Last Activity | Most recent sensor timestamp |
+| Reassembly | Progress bar showing image reassembly completion (%) |
+| View | Links to live stream and last completed image |
+
+**Query Parameters (device endpoints):**
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `mjpeg` | `"true"` / `"false"` | `"true"` | Returns a single JPEG instead of MJPEG stream |
 | `det` | `"true"` / omitted | omitted | Enables detection bbox overlay |
 
-**Examples:**
+**Examples (device endpoints):**
 
 | URL | Description |
 |---|---|
@@ -95,6 +108,10 @@ MJPEG streamer is built on raw `http.createServer` and handles all HTTP methods 
 | Undefined route | `404 Not Found` |
 
 **Port:** `8080` (container). See `docker-compose.yml` for host mapping.
+
+### Save to Disk
+
+If `SAVE_DIR` is set, completed images are automatically saved to disk when reassembly finishes. Files are saved as `{SAVE_DIR}/{devEui}_{timestamp}_det.jpg`. If detection data is available and `bbox` overlay is enabled, the image includes bounding box overlay; otherwise the raw JPEG is saved.
 
 ### Automatic Upload
 If `UPLOAD_URL` is set, the system performs a `multipart/form-data` POST request when reassembly is complete. The uploaded `snap` is a composed JPEG with timestamp overlay (and bbox overlay if available).
