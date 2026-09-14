@@ -386,11 +386,10 @@ class ImageReassembler:
         
         img_data = img_data[:reassembled_len]
 
-        # Update raw data and notify streamers even if the image is partial
+        # Update raw data even if the image is partial
         # Sharp in mjpeg-streamer can handle truncated JPEGs with failOn: 'none'
         await r.set(f"{rtsp_base}:image", img_data, ex=86400)
         await r.set(f"{rtsp_base}:sense_time", sense_time, ex=86400)
-        await r.publish(f"EdgeEye:updated:{dev_eui}", "updated")
 
         try:
             img = Image.open(io.BytesIO(img_data))
@@ -427,6 +426,10 @@ class ImageReassembler:
         except Exception as e:
             if is_last:
                 print(f"[{dev_eui}] Final image error: {e}")
+
+        # Notify streamers last (even if the image is partial) so that on completion
+        # upload:ready already exists when mjpeg-streamer's doUpload() runs GETDEL on it
+        await r.publish(f"EdgeEye:updated:{dev_eui}", "updated")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="EdgeEye Image Reassembler (Chirpstack v4 MQTT)")
