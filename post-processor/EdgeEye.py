@@ -306,6 +306,7 @@ class ImageReassembler:
         completed_key = f"{prefix}:completed:{dev_eui}:{epoch}"
         buffer_key = f"{prefix}:buffer:{dev_eui}:{epoch}"
         state_key = f"{prefix}:state:{dev_eui}:{epoch}"
+        started_key = f"{prefix}:started:{dev_eui}:{epoch}"
         missing_key = f"{prefix}:missing:{dev_eui}:{epoch}"
         last_dl_key = f"{prefix}:last_dl:{dev_eui}:{epoch}"
 
@@ -344,6 +345,7 @@ class ImageReassembler:
                 if self.sessions is not None:
                     await self.sessions.release(r, dev_eui)
             await r.set(active_epoch_key, epoch, ex=86400)
+            await r.set(started_key, time.time(), ex=86400)  # transfer time is measured from here
             await r.delete(f"ImageToRtsp:{dev_eui}:det")
 
         num_sessions = msg.get('num_sessions', 0)
@@ -480,7 +482,7 @@ class ImageReassembler:
 
         # Always check for finalization using the actual contiguous offset
         await self._finalize_image(r, dev_eui, app_id, epoch, sense_time, buffer_key, 
-                                   reassembled_offset, total, last_frag, completed_key, state_key, state)
+                                   reassembled_offset, total, last_frag, completed_key, state_key, started_key, state)
 
     async def _start_sessions(self, r, prefix, dev_eui, app_id, epoch, num_sessions):
         """Create the virtual sessions for this image and hand them to the camera (fPort 5)."""
@@ -519,17 +521,20 @@ class ImageReassembler:
                 await r.aclose()
 
     @staticmethod
-    def _transfer_stats(state):
+    def _transfer_timing(started, image_bytes):
+        """Seconds from the first fragment seen of an image until now, and the rate in bytes/s."""
+        if not started:
+            return None, None
+        seconds = time.time() - float(started)
+        if seconds <= 0:
+            return None, None
+        return round(seconds, 1), round(image_bytes / seconds)
+
+    @staticmethod
+    def _transfer_stats(state, transfer_sec, bytes_per_sec):
         per_session = state.get('per_session') or {}
         parts = [f"{k}={per_session[k]}" for k in sorted(per_session)]
-        elapsed = ""
-        meta = state.get('meta') or []
-        if meta and meta[0].get('ts'):
-            try:
-                t0 = datetime.fromisoformat(meta[0]['ts'])
-                elapsed = f", elapsed {(datetime.now(timezone.utc) - t0).total_seconds():.0f}s"
-            except ValueError:
-                pass
+        elapsed = f", elapsed {transfer_sec}s, {bytes_per_sec} B/s" if transfer_sec else ""
         return f"Transfer stats: fragments per session {' '.join(parts) or 'n/a'}{elapsed}"
 
     @staticmethod
@@ -553,6 +558,7 @@ class ImageReassembler:
         await r.delete(
             f"{prefix}:buffer:{dev_eui}:{old_epoch}",
             f"{prefix}:state:{dev_eui}:{old_epoch}",
+            f"{prefix}:started:{dev_eui}:{old_epoch}",
             f"{prefix}:missing:{dev_eui}:{old_epoch}",
             f"{prefix}:gap_pending:{dev_eui}:{old_epoch}",
             f"{prefix}:last_dl:{dev_eui}:{old_epoch}",
@@ -588,7 +594,7 @@ class ImageReassembler:
         return new_len
 
     async def _finalize_image(self, r, dev_eui, app_id, epoch, sense_time, buffer_key, 
-                              reassembled_len, total_size, is_last, completed_key, state_key, state):
+                              reassembled_len, total_size, is_last, completed_key, state_key, started_key, state):
         rtsp_base = f"ImageToRtsp:{dev_eui}"
         
         img_data = await r.get(buffer_key)
@@ -612,8 +618,9 @@ class ImageReassembler:
                     img.save(output, format="JPEG")
                     jpeg_bytes = output.getvalue()
                 
+                transfer_sec, bytes_per_sec = self._transfer_timing(await r.getdel(started_key), total_size)
                 print(f"[{dev_eui}] Reassembly complete! {len(jpeg_bytes)} bytes (Original: {total_size} bytes)")
-                print(f"[{dev_eui}] {self._transfer_stats(state)}")
+                print(f"[{dev_eui}] {self._transfer_stats(state, transfer_sec, bytes_per_sec)}")
                 if self.sessions is not None:
                     await self.sessions.release(r, dev_eui)
                 await r.set(f"{rtsp_base}:image:last", jpeg_bytes, ex=86400)
@@ -634,6 +641,9 @@ class ImageReassembler:
                     'system_voltage': state.get('system_voltage'),
                     'ambient_light_lux': state.get('ambient_light_lux'),
                     'det': state.get('det'),
+                    'transfer_sec': transfer_sec,
+                    'image_bytes': total_size,
+                    'bytes_per_sec': bytes_per_sec,
                 }
                 await r.set(f"{rtsp_base}:upload:ready", json.dumps(upload_meta), ex=300)
                 

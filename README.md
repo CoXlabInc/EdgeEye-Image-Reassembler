@@ -125,6 +125,9 @@ If `UPLOAD_URL` is set, the system performs a `multipart/form-data` POST request
 - `data`: JSON string containing sensor data:
     - `system_voltage`: System voltage in Volts (typically present).
     - `ambient_light_lux`: Ambient light level in Lux (optional).
+    - `transfer_sec`: Seconds from the first fragment of the image received to reassembly completion.
+    - `image_bytes`: Size of the JPEG as sent by the camera, in bytes.
+    - `bytes_per_sec`: Transfer rate, `image_bytes / transfer_sec`.
     - `det`: Object detection list (optional, mode-dependent).
 
 **`DET_UPLOAD_MODE` behavior:**

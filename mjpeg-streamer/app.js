@@ -237,6 +237,9 @@ async function postComposite(device, meta, senseTime, includeDet, overlay) {
     const dataPayload = {};
     if (meta.system_voltage) dataPayload.system_voltage = meta.system_voltage;
     if (meta.ambient_light_lux) dataPayload.ambient_light_lux = meta.ambient_light_lux;
+    if (meta.transfer_sec) dataPayload.transfer_sec = meta.transfer_sec;
+    if (meta.image_bytes) dataPayload.image_bytes = meta.image_bytes;
+    if (meta.bytes_per_sec) dataPayload.bytes_per_sec = meta.bytes_per_sec;
     if (includeDet && meta.det) dataPayload.det = meta.det;
 
     const form = new FormData();
