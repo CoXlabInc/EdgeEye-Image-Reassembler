@@ -34,13 +34,15 @@ This project is a reference bridge for integrating [EdgeEye](https://www.coxlab.
    - `MQTT_URL`: Chirpstack MQTT broker URL.
    - `MQTT_USER`: (Optional) MQTT username for authentication.
    - `MQTT_PASS`: (Optional) MQTT password for authentication.
-   - `DEVICE_PROFILE_ID`: EdgeEye device profile UUID from Chirpstack (Required).
+   - `DEVICE_PROFILE_ID`: EdgeEye device profile UUID from Chirpstack (Required unless `DEVICE_PROFILES` is set).
      - **Note**: This bridge uses the Device Profile ID to identify EdgeEye packets. It is **highly recommended** to create and use a dedicated Device Profile for EdgeEye devices to avoid processing unrelated traffic.
+   - `DEVICE_PROFILES`: (Optional) Serve several device profiles from one reassembler, each with its own number of virtual sessions per image: `PROFILE_ID_A:0,PROFILE_ID_B:2` (`0` = single session, up to `2`). When set, it replaces `DEVICE_PROFILE_ID`, `MULTI_SESSION` and `NUM_SESSIONS`; the other multi-session settings below still apply.
    - `UPLOAD_URL`: (Optional) Remote HTTP endpoint for image uploads.
    - `UPLOAD_HEADERS`: (Optional) JSON string of HTTP headers for uploads (e.g., `{"X-API-Key": "your-token"}`).
    - `DET_UPLOAD_MODE`: (Optional) How to upload object detection data. `1`=included with snap, `2`=det first then snap (default), `3`=det first then snap alone (without det).
    - `UPLOAD_OVERLAY`: (Optional) Comma-separated overlay types for the upload snap. `timestamp,bbox` (default) includes both; `timestamp` for timestamp only; `bbox` for bbox only; `none` for raw JPEG.
    - `SAVE_DIR`: (Optional) Directory name for saving completed images to disk. Host path: `./{SAVE_DIR}`, container path: `/data/{SAVE_DIR}`. Leave empty to disable.
+   - `MULTI_SESSION`: (Optional) `1` enables multi-session uplink. For each image the reassembler issues `NUM_SESSIONS` extra LoRaWAN sessions (default 2, the firmware maximum), hands their DevAddr and keys to the camera (fPort 5) and decodes the frames sent on them itself from the gateway bridge topics (`GATEWAY_TOPIC_PREFIX`, default `kr920`). The sessions are not registered in ChirpStack, so ChirpStack never answers them with MAC commands. Their DevAddrs come from `SESSION_DEVADDR_PREFIX` (default `fe000000/7`), which must lie outside the network's NetID range. Requirements: the gateway bridge must not filter uplinks by NetID, and the MQTT user must be allowed to subscribe to the gateway topics.
    - `TZ`: Local timezone (e.g., `Asia/Seoul`).
    - `LANG`: Locale (e.g., `ko_KR.UTF-8`).
 

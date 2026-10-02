@@ -48,6 +48,16 @@ services:
       - --redis_url
       - ${REDIS_URL:-redis://redis}
       - --device_profile_id
-      - ${DEVICE_PROFILE_ID}
+      - ${DEVICE_PROFILE_ID:-}
+      - --device_profiles
+      - ${DEVICE_PROFILES:-}
+      - --multi_session
+      - ${MULTI_SESSION:-0}
+      - --gateway_topic_prefix
+      - ${GATEWAY_TOPIC_PREFIX:-kr920}
+      - --session_devaddr_prefix
+      - ${SESSION_DEVADDR_PREFIX:-fe000000/7}
+      - --num_sessions
+      - ${NUM_SESSIONS:-2}
     extra_hosts:
       - "host.docker.internal:host-gateway"
