@@ -60,7 +60,8 @@ class ImageReassembler:
         self.FLAG_MULTI_UP   = 0x10
         self.FLAG_OBJDET     = 0x20
 
-        self.BUFFER_TTL = 3600         # seconds; a partial image buffer must not outlive its state
+        self.REASSEMBLY_TTL = 86400    # seconds an unfinished image's state and buffer are kept after its last fragment;
+                                       # the camera may retry a stalled image until its next photo, up to ~18 h later
         self.GAP_REQUEST_DELAY = 5.0   # seconds a gap must persist before it is treated as a loss
         self.GAP_PENDING_TTL = 30      # seconds to wait for the device to resend a requested range
         self.PORT5_RESEND_DELAY = 15   # seconds without a session uplink before the grant is resent
@@ -380,7 +381,7 @@ class ImageReassembler:
             if sysv is not None:
                 state['system_voltage'] = sysv
             state['meta'].append({'fCnt': msg['f_cnt'], 'ts': datetime.now(timezone.utc).isoformat()})
-            await r.set(state_key, json.dumps(state), ex=3600)
+            await r.set(state_key, json.dumps(state), ex=self.REASSEMBLY_TTL)
             await r.set(f"ImageToRtsp:{dev_eui}:det", json.dumps(det), ex=86400)
             await r.set(f"ImageToRtsp:{dev_eui}:sense_time", sense_time, ex=86400)
             await r.set(f"ImageToRtsp:{dev_eui}:app_id", app_id, ex=86400)
@@ -466,7 +467,7 @@ class ImageReassembler:
         slot = f"s{session_index}"
         per_session[slot] = per_session.get(slot, 0) + 1
         state['meta'].append({'fCnt': msg['f_cnt'], 'ts': datetime.now(timezone.utc).isoformat()})
-        await r.set(state_key, json.dumps(state), ex=3600)
+        await r.set(state_key, json.dumps(state), ex=self.REASSEMBLY_TTL)
 
         total = state['total_size']
         percent = (reassembled_offset / total * 100) if total > 0 else 0
@@ -590,7 +591,7 @@ class ImageReassembler:
         new_len = int(await r.setrange(key, offset, data))
         # SETRANGE never sets a TTL: without this, buffers of images that never
         # complete stay in Redis forever.
-        await r.expire(key, self.BUFFER_TTL)
+        await r.expire(key, self.REASSEMBLY_TTL)
         return new_len
 
     async def _finalize_image(self, r, dev_eui, app_id, epoch, sense_time, buffer_key, 
