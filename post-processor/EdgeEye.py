@@ -64,7 +64,8 @@ class ImageReassembler:
                                        # the camera may retry a stalled image until its next photo, up to ~18 h later
         self.GAP_REQUEST_DELAY = 5.0   # seconds a gap must persist before it is treated as a loss
         self.GAP_PENDING_TTL = 30      # seconds to wait for the device to resend a requested range
-        self.PORT5_RESEND_DELAY = 15   # seconds without a session uplink before the grant is resent
+        self.PORT5_RESEND_DELAY = 5    # seconds without a session uplink before the grant is resent
+                                       # (a received grant shows session uplinks within 2-3 s)
         self.PORT5_MAX_SENDS = 3       # session grant attempts per image
 
     def start(self):
