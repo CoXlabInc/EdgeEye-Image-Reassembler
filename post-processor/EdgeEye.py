@@ -67,6 +67,8 @@ class ImageReassembler:
         self.PORT5_RESEND_DELAY = 5    # seconds without a session uplink before the grant is resent
                                        # (a received grant shows session uplinks within 2-3 s)
         self.PORT5_MAX_SENDS = 3       # session grant attempts per image
+        self.UNSET_CLOCK_BEFORE = 1577836800  # 2020-01-01 UTC: earlier image IDs come from a device clock the
+                                              # network has not set yet (it starts at 2000-01-01 on boot)
 
     def start(self):
         """Initialize and start the processor"""
@@ -303,7 +305,7 @@ class ImageReassembler:
         first_frag = bool(flags & self.FLAG_FIRST_FRAG)
         last_frag = bool(flags & self.FLAG_LAST_FRAG)
         frag_data = raw[i:]
-        sense_time = datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat().replace('+00:00', 'Z')
+        unset_clock = epoch < self.UNSET_CLOCK_BEFORE
 
         prefix = f"PP:EdgeEye"
         active_epoch_key = f"{prefix}:active_epoch:{dev_eui}"
@@ -329,7 +331,19 @@ class ImageReassembler:
         else:
             await r.set(parent_app_key, app_id, ex=86400)
 
-        if await r.exists(completed_key):
+        # IDs from an unset clock repeat after reboots (2000-01-01 + uptime). A first fragment
+        # under such an ID that was already completed, or that carries another image size than
+        # the image in progress, starts a new photo; a resent first fragment has the same size.
+        reused_id = False
+        if unset_clock and first_frag:
+            if await r.exists(completed_key):
+                reused_id = True
+            else:
+                prev_state = await r.get(state_key)
+                prev_size = json.loads(prev_state).get('total_size') if prev_state else None
+                reused_id = prev_size is not None and prev_size != offset
+
+        if not reused_id and await r.exists(completed_key):
             if not await r.exists(last_dl_key):
                 await self._send_downlink(app_id, dev_eui, 4, epoch.to_bytes(5, 'little'))
                 await r.set(last_dl_key, 1, ex=10)
@@ -337,7 +351,7 @@ class ImageReassembler:
 
         active_epoch = await r.get(active_epoch_key)
         active_epoch = int(active_epoch) if active_epoch else 0
-        if epoch != active_epoch:
+        if epoch != active_epoch or reused_id:
             # A FIRST fragment always starts a new image, whatever its epoch: the device
             # clock may move backwards (reboot before time sync). Non-first fragments
             # of an older epoch are late stragglers and are dropped.
@@ -348,9 +362,27 @@ class ImageReassembler:
                 await self._cleanup_epoch(r, prefix, dev_eui, active_epoch)
                 if self.sessions is not None:
                     await self.sessions.release(r, dev_eui)
+            if unset_clock:
+                # What an earlier photo under the same ID left must not count as received
+                # or granted for this one.
+                await self._cleanup_epoch(r, prefix, dev_eui, epoch)
+                await r.delete(completed_key,
+                               f"{prefix}:port5_sent:{dev_eui}:{epoch}",
+                               f"{prefix}:session_seen:{dev_eui}:{epoch}")
+                device_time = datetime.fromtimestamp(epoch, tz=timezone.utc)
+                print(f"[{dev_eui}] Device clock not set (0x{epoch:08X} = {device_time:%Y-%m-%d %H:%M:%S}): "
+                      f"image dated by its arrival" + (", ID reused by a new photo" if reused_id else ""))
             await r.set(active_epoch_key, epoch, ex=86400)
             await r.set(started_key, time.time(), ex=86400)  # transfer time is measured from here
             await r.delete(f"ImageToRtsp:{dev_eui}:det")
+
+        # The image's time is the device's, or with an unset device clock the arrival of the
+        # image's first data here (the photo was taken seconds before).
+        sense_epoch = epoch
+        if unset_clock:
+            started = await r.get(started_key)
+            sense_epoch = int(float(started)) if started else int(time.time())
+        sense_time = datetime.fromtimestamp(sense_epoch, tz=timezone.utc).isoformat().replace('+00:00', 'Z')
 
         num_sessions = msg.get('num_sessions', 0)
         if self.sessions is not None and num_sessions > 0 and first_frag and not last_frag and not from_session:
