@@ -236,9 +236,11 @@ class ImageReassembler:
             try:
                 r = redis.Redis(connection_pool=self.pool)
                 if msg['f_port'] == 2:
-                    category = self._handle_fail_report(dev_eui, msg['raw'])
-                    if category == 2 and self.sessions is not None:
+                    category, sub = self._handle_fail_report(dev_eui, msg['raw'])
+                    if category == 2 and sub != 2 and self.sessions is not None:
                         # The device gave up sending; its virtual sessions are no longer needed.
+                        # Not on Busy (sub-code 2): a new photo could not start, but the image
+                        # in progress keeps sending on its sessions.
                         await self.sessions.release(r, dev_eui)
                 elif msg['f_port'] == 1:
                     await self._handle_image_fragment(r, msg)
@@ -272,7 +274,7 @@ class ImageReassembler:
             parts.append(f"| {sysv:.3f}V")
 
         print(" ".join(parts))
-        return cat
+        return cat, sub
 
     async def _handle_image_fragment(self, r, msg):
         dev_eui = msg['dev_eui']
