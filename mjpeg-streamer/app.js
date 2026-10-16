@@ -123,6 +123,22 @@ function buildComposites(metadata, timestampStr, detections, overlay = { timesta
     return composites;
 }
 
+// True once a JPEG holds everything up to its first scan (SOS). Before that, as at the start of
+// an image still being received, there is nothing to draw and decoding it only fails.
+function jpegHeaderComplete(buf) {
+    if (buf.length < 4 || buf[0] !== 0xFF || buf[1] !== 0xD8) return false;
+    let i = 2;
+    while (i + 4 <= buf.length) {
+        if (buf[i] !== 0xFF) return false;
+        const marker = buf[i + 1];
+        if (marker === 0xFF) { i++; continue; }  // fill byte before a marker
+        const len = buf.readUInt16BE(i + 2);
+        if (marker === 0xDA) return i + 2 + len <= buf.length;
+        i += 2 + len;
+    }
+    return false;
+}
+
 async function fetchAndSendImage(res, bufferKey, timestampKey, mjpeg, detKey) {
     if (res.writableEnded) return;
 
@@ -130,6 +146,13 @@ async function fetchAndSendImage(res, bufferKey, timestampKey, mjpeg, detKey) {
     
     if (!buffer || buffer.length === 0) {
         buffer = await redisClient.GET(redis.commandOptions({ returnBuffers: true }), bufferKey + ':last');
+    } else if (!jpegHeaderComplete(buffer)) {
+        // The image being received has not got past its header yet. A live stream keeps its
+        // current frame; a single request gets the last complete image instead.
+        if (mjpeg) return 0;
+        buffer = await redisClient.GET(redis.commandOptions({ returnBuffers: true }), bufferKey + ':last');
+        timestampKey += ':last';
+        if (detKey) detKey += ':last';
     }
 
     if (buffer && buffer.length > 0) {
@@ -552,7 +575,7 @@ var server = http.createServer(async (req, res) => {
             const sendHeartbeat = async () => {
                 if (res.writableEnded) return;
                 const size = await fetchAndSendImage(res, bufferKey, timestampKey, true, detKey);
-                console.log(`[${device}] Heartbeat frame sent: ${size} bytes`);
+                if (size) console.log(`[${device}] Heartbeat frame sent: ${size} bytes`);
                 resetHeartbeat();
             };
 
@@ -566,7 +589,7 @@ var server = http.createServer(async (req, res) => {
                     doUploadDet(device);
                 } else {
                     const size = await fetchAndSendImage(res, bufferKey, timestampKey, true, detKey);
-                    console.log(`[${device}] Updated frame sent: ${size} bytes`);
+                    if (size) console.log(`[${device}] Updated frame sent: ${size} bytes`);
                     resetHeartbeat();
                     doUpload(device);
                 }
@@ -583,7 +606,12 @@ var server = http.createServer(async (req, res) => {
 
         } else {
             // Single image request
-            await fetchAndSendImage(res, bufferKey, timestampKey, false, detKey);
+            const size = await fetchAndSendImage(res, bufferKey, timestampKey, false, detKey);
+            if (!size && !res.writableEnded) {
+                // Nothing could be drawn: answer rather than leave the request hanging.
+                res.statusCode = 503;
+                res.end('Image not ready');
+            }
         }
     } else {
         res.statusCode = 404;
