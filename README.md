@@ -10,6 +10,22 @@ This project is a reference bridge for integrating [EdgeEye](https://www.coxlab.
 - **MJPEG Streaming**: Provides real-time visual progress and the latest completed images via HTTP.
 - **Automatic Upload**: Optionally POSTs reassembled images to a remote HTTP endpoint.
 
+## Failure Reports (FPORT 2)
+
+Reports contain exactly 4 bytes: category (1B), sub-code (1B), and system
+voltage (2B little-endian mV). Invalid lengths are logged and ignored.
+
+| Category | Sub-codes decoded by the reassembler |
+|---|---|
+| `0` Boot | Raw sub-code is logged |
+| `1` Snap | `0` Memory, `1` Filesystem, `2` Encoding |
+| `2` Send | `0` Memory, `1` Filesystem, `2` Busy, `3` User interrupt |
+| `3` External trigger | Retake triggered by an external contact signal; raw sub-code is logged |
+
+Logs include numeric codes and voltage; unknown codes remain visible.
+Send failures release virtual sessions except for Busy (`2`), which keeps
+the current transfer's sessions. Invalid reports do not release sessions.
+
 ## Prerequisites
 
 - Docker and Docker Compose

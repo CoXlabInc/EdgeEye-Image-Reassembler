@@ -251,13 +251,22 @@ class ImageReassembler:
                 traceback.print_exc()
 
     def _handle_fail_report(self, dev_eui, raw):
-        categories = {0: "Boot", 1: "Snap", 2: "Send"}
+        if len(raw) != 4:
+            print(f"[{dev_eui}] Invalid failure report: expected 4 bytes, got {len(raw)}")
+            return None, None
+
+        categories = {
+            0: "Boot",
+            1: "Snap",
+            2: "Send",
+            3: "External trigger",
+        }
         snap_sub = {0: "Memory", 1: "Filesystem", 2: "Encoding"}
         send_sub = {0: "Memory", 1: "Filesystem", 2: "Busy", 3: "User interrupt"}
 
-        cat = raw[0] if len(raw) > 0 else None
-        sub = raw[1] if len(raw) > 1 else None
-        sysv = int.from_bytes(raw[2:4], 'little') / 1000.0 if len(raw) > 3 else None
+        cat = raw[0]
+        sub = raw[1]
+        sysv = int.from_bytes(raw[2:4], 'little') / 1000.0
 
         cat_name = categories.get(cat, f"Unknown({cat})")
 
@@ -269,7 +278,7 @@ class ImageReassembler:
         elif sub is not None:
             sub_name = f"Sub={sub}"
 
-        parts = [f"[{dev_eui}] Device Error: {cat_name}"]
+        parts = [f"[{dev_eui}] Device Error: {cat_name} [category={cat}, sub={sub}]"]
         if sub_name:
             parts.append(f"({sub_name})")
         if sysv is not None:

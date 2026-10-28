@@ -77,7 +77,8 @@ This fragment does NOT advance the `received` reassembly cursor. Subsequent frag
 
 4 bytes: Category (1B), Sub-code (1B), System voltage (2B LE mV).
 
-Categories: `FAIL_BOOT=0`, `FAIL_SNAP=1`, `FAIL_SEND=2`.
+Categories: `FAIL_BOOT=0`, `FAIL_SNAP=1`, `FAIL_SEND=2`, `FAIL_EXT_TRIGGER=3`.
+`FAIL_EXT_TRIGGER` means a retake triggered by an external contact signal.
 
 ### Downlink — Fragment Retransmission (FPORT 4)
 
