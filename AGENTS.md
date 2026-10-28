@@ -6,7 +6,7 @@ Two services communicate through **Redis** and receive LoRaWAN uplinks from Chir
 
 | Service | Language | Entrypoint | Role |
 |---|---|---|---|---|
-| `edgeeye_reassembler` | Python 3 | `post-processor/EdgeEye.py` | Image fragment reassembly |
+| `edgeeye_reassembler` | Python 3 | `post-processor/EdgeEye.py` | Image and video fragment reassembly |
 | `mjpeg_streamer` | Node.js (ESM) | `mjpeg-streamer/app.js` | MJPEG HTTP streaming + composite + HTTP upload |
 
 ## Run
@@ -28,6 +28,7 @@ Required `.env` keys: `MQTT_URL`, `REDIS_URL`, `DEVICE_PROFILE_ID`
 | `ImageToRtsp:{devEui}:det` | Latest detection data (set by Python on OBJDET) |
 | `ImageToRtsp:{devEui}:det:last` | Detection data for last completed image |
 | `ImageToRtsp:{devEui}:upload:ready` | Upload trigger metadata (set by Python, consumed by Node.js via GETDEL) |
+| `ImageToRtsp:{devEui}:video:{id}` | Completed MP4 bytes; its `:upload:ready` key holds upload metadata |
 | `EdgeEye:updated:{devEui}` | Pub/Sub channel (reassembly done notification) |
 
 ## Ports
@@ -40,7 +41,7 @@ Required `.env` keys: `MQTT_URL`, `REDIS_URL`, `DEVICE_PROFILE_ID`
 
 ### Uplink — Image Fragment (FPORT 1)
 
-Header (9–12 bytes), immediately followed by JPEG data:
+Header (9 or 11 bytes), immediately followed by JPEG data:
 
 | Offset | Size | Field | Description |
 |---|---|---|---|---|
@@ -50,6 +51,12 @@ Header (9–12 bytes), immediately followed by JPEG data:
 | 9–10 | 2 | **System Voltage** | mV (LE). Only if FLAG_SYSV (0x04) |
 
 Frame type: first and last fragments use **CONFIRMED**; middle fragments use **UNCONFIRMED**.
+
+Bit `0x08` is ignored; no ambient-light bytes are parsed. Legacy ALS payloads are unsupported.
+
+### Uplink — MP4 Fragment (FPORT 6)
+
+The same header and retransmission protocol applies to a single complete MP4 file, with a maximum size of 16,777,215 bytes. `FLAG_OBJDET` is invalid. The device must use a unique reassembly ID per transfer and send only one image or video at a time. The ID retains the image protocol's timestamp semantics. Completed video is stored and uploaded byte-for-byte; it is not shown in the MJPEG stream.
 
 ### Uplink — Object Detection (FPORT 1, FLAG_OBJDET)
 
@@ -97,6 +104,7 @@ Adds up to 2 extra LoRaWAN sessions: Reassembly ID (5B) + Session0 DevAddr/NwkSK
 | 3 | Down | Configuration (Period, Width, Height) |
 | 4 | Down | Fragment retransmission request |
 | 5 | Down | Add secondary sessions |
+| 6 | Up | MP4 fragment |
 | 67 | Down | FUOTA firmware update |
 
 ## EdgeEye.py key behavior

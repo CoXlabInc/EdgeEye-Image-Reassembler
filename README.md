@@ -115,6 +115,12 @@ The root endpoint (`/`) displays all known devices with their status in a table.
 
 If `SAVE_DIR` is set, completed images are automatically saved to disk when reassembly finishes. Files are saved as `{SAVE_DIR}/{devEui}_{timestamp}_det.jpg`. If detection data is available and `bbox` overlay is enabled, the image includes bounding box overlay; otherwise the raw JPEG is saved.
 
+Completed MP4 files are saved unchanged as `{SAVE_DIR}/{devEui}_{timestamp}_{reassembly_id}.mp4`. Saving works independently of `UPLOAD_URL`.
+
+### MP4 uplink
+
+FPort 6 carries a complete MP4 file using the same 9-byte fragment header and optional 2-byte system voltage as the FPort 1 JPEG protocol. The first fragment carries the total size; subsequent fragments carry the byte offset. The size is limited to 16,777,215 bytes. FPort 4 handles missing ranges and completion acknowledgements for both formats. A device must use a unique timestamp-based reassembly ID for each transfer and send one image or video at a time. Object detection payloads are not supported on FPort 6. Flag bit `0x08` is ignored and no ambient-light bytes are consumed; legacy ALS payloads are unsupported. Videos are not displayed in the MJPEG stream.
+
 ### Automatic Upload
 If `UPLOAD_URL` is set, the system performs a `multipart/form-data` POST request when reassembly is complete. The uploaded `snap` is a composed JPEG with timestamp overlay (and bbox overlay if available).
 
@@ -124,11 +130,12 @@ If `UPLOAD_URL` is set, the system performs a `multipart/form-data` POST request
 - `_timestamp`: ISO 8601 timestamp string (UTC/local).
 - `data`: JSON string containing sensor data:
     - `system_voltage`: System voltage in Volts (typically present).
-    - `ambient_light_lux`: Ambient light level in Lux (optional).
     - `transfer_sec`: Seconds from the first fragment of the image received to reassembly completion.
     - `image_bytes`: Size of the JPEG as sent by the camera, in bytes.
     - `bytes_per_sec`: Transfer rate, `image_bytes / transfer_sec`.
     - `det`: Object detection list (optional, mode-dependent).
+
+MP4 uploads use the same endpoint, `deviceId`, `_timestamp`, and `data` fields, but replace `snap` with `video` (filename `video.mp4`, content type `video/mp4`). The data contains `system_voltage`, `transfer_sec`, `video_bytes`, and `bytes_per_sec` when available. Video bytes are not re-encoded or overlaid.
 
 **`DET_UPLOAD_MODE` behavior:**
 - **1**: Detection data is included in the `data` field of a single upload with `snap`.

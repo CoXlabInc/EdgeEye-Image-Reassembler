@@ -81,6 +81,9 @@ await globalSub.pSubscribe('EdgeEye:updated:*', async (message, channel) => {
     const device = channel.replace('EdgeEye:updated:', '');
     if (message === "det") {
         doUploadDet(device);
+    } else if (/^video:\d+$/.test(message)) {
+        doUploadVideo(device, message.slice(6)).catch(e =>
+            console.error(`[${device}] Video handling failed: ${e.message}`));
     } else {
         doUpload(device);
     }
@@ -201,7 +204,6 @@ async function postDetOnly(device, meta, senseTime, appId) {
 
     const dataPayload = {};
     if (meta.system_voltage) dataPayload.system_voltage = meta.system_voltage;
-    if (meta.ambient_light_lux) dataPayload.ambient_light_lux = meta.ambient_light_lux;
     if (meta.det) dataPayload.det = meta.det;
     body.data = dataPayload;
 
@@ -259,7 +261,6 @@ async function postComposite(device, meta, senseTime, includeDet, overlay) {
 
     const dataPayload = {};
     if (meta.system_voltage) dataPayload.system_voltage = meta.system_voltage;
-    if (meta.ambient_light_lux) dataPayload.ambient_light_lux = meta.ambient_light_lux;
     if (meta.transfer_sec) dataPayload.transfer_sec = meta.transfer_sec;
     if (meta.image_bytes) dataPayload.image_bytes = meta.image_bytes;
     if (meta.bytes_per_sec) dataPayload.bytes_per_sec = meta.bytes_per_sec;
@@ -303,6 +304,7 @@ async function doUploadDet(device) {
 async function saveImages(device, senseTime, hasDet, appId) {
     const dir = getSaveDir(appId);
     if (!dir) return;
+    await fs.mkdir(dir, { recursive: true });
     const jpegBuffer = await redisClient.GET(
         redis.commandOptions({ returnBuffers: true }),
         `ImageToRtsp:${device}:image:last`
@@ -334,7 +336,6 @@ async function doUpload(device) {
     if (!metaRaw) return;
     const meta = JSON.parse(metaRaw);
     const appId = meta.app_id;
-    if (!getUploadUrl(appId)) return;
     const senseTime = meta.sense_time || "Unknown";
     const hasDet = meta.det && meta.det.length > 0;
     console.log(`[${device}] Upload triggered (app=${appId}, mode=${detUploadMode}, overlay=${uploadOverlayStr})`);
@@ -343,12 +344,49 @@ async function doUpload(device) {
         console.error(`[${device}] Save failed: ${e.message}`)
     );
 
+    if (!getUploadUrl(appId)) return;
+
     try {
         const includeDet = detUploadMode !== 3;
         await postComposite(device, meta, senseTime, includeDet, uploadOverlay);
     } catch (e) {
         console.error(`[${device}] Upload error: ${e.message}`);
     }
+}
+
+async function doUploadVideo(device, epoch) {
+    const videoKey = `ImageToRtsp:${device}:video:${epoch}`;
+    const metaRaw = await redisClient.getDel(`${videoKey}:upload:ready`);
+    if (!metaRaw) return;
+    const meta = JSON.parse(metaRaw);
+    const video = await redisClient.GET(redis.commandOptions({ returnBuffers: true }), videoKey);
+    if (!video) return;
+    const senseTime = meta.sense_time || 'Unknown';
+    const dir = getSaveDir(meta.app_id);
+    if (dir) {
+        try {
+            await fs.mkdir(dir, { recursive: true });
+            const ts = new Date(senseTime).toISOString().replace(/[:.]/g, '-');
+            await fs.writeFile(path.join(dir, `${device}_${ts}_${epoch}.mp4`), video);
+        } catch (e) {
+            console.error(`[${device}] Video save failed: ${e.message}`);
+        }
+    }
+    const url = getUploadUrl(meta.app_id);
+    if (!url) return;
+    const data = {};
+    for (const key of ['system_voltage', 'transfer_sec', 'video_bytes', 'bytes_per_sec']) {
+        if (meta[key] != null) data[key] = meta[key];
+    }
+    const form = new FormData();
+    form.append('video', new Blob([video], { type: 'video/mp4' }), 'video.mp4');
+    form.append('deviceId', device);
+    appendTimestamp(form, device, senseTime);
+    form.append('data', JSON.stringify(data));
+    const headers = getUploadHeaders(meta.app_id) ? JSON.parse(getUploadHeaders(meta.app_id)) : {};
+    const resp = await fetch(url, { method: 'POST', headers, body: form });
+    if (!resp.ok) console.error(`[${device}] Video upload failed (${resp.status}): ${await resp.text()}`);
+    else console.log(`[${device}] Video uploaded to ${url}`);
 }
 
 async function gatherDeviceData() {
@@ -587,7 +625,7 @@ var server = http.createServer(async (req, res) => {
             await subscriber.subscribe(updateChannel, async (message) => {
                 if (message === "det") {
                     doUploadDet(device);
-                } else {
+                } else if (message === "updated") {
                     const size = await fetchAndSendImage(res, bufferKey, timestampKey, true, detKey);
                     if (size) console.log(`[${device}] Updated frame sent: ${size} bytes`);
                     resetHeartbeat();

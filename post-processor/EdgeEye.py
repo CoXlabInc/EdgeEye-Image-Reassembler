@@ -56,7 +56,6 @@ class ImageReassembler:
         self.FLAG_FIRST_FRAG = 0x01
         self.FLAG_LAST_FRAG  = 0x02
         self.FLAG_SYSV       = 0x04
-        self.FLAG_ALS        = 0x08
         self.FLAG_MULTI_UP   = 0x10
         self.FLAG_OBJDET     = 0x20
 
@@ -245,7 +244,7 @@ class ImageReassembler:
                         # Not on Busy (sub-code 2): a new photo could not start, but the image
                         # in progress keeps sending on its sessions.
                         await self.sessions.release(r, dev_eui)
-                elif msg['f_port'] == 1:
+                elif msg['f_port'] in (1, 6):
                     await self._handle_image_fragment(r, msg)
                 await r.aclose()
             except Exception:
@@ -288,6 +287,12 @@ class ImageReassembler:
             return
 
         flags = raw[0]
+        is_video = msg['f_port'] == 6
+        if is_video and flags & self.FLAG_OBJDET:
+            print(f"[{dev_eui}] Object detection is not supported on video uplinks")
+            return
+        if flags & self.FLAG_SYSV and len(raw) < 11:
+            return
         epoch = int.from_bytes(raw[1:6], 'little')
         offset = int.from_bytes(raw[6:9], 'little')
         
@@ -296,11 +301,6 @@ class ImageReassembler:
         if (flags & self.FLAG_SYSV):
             sysv = int.from_bytes(raw[i:i+2], 'little') / 1000.0
             i += 2
-        
-        als = None
-        if (flags & self.FLAG_ALS):
-            als = int.from_bytes(raw[i:i+3], 'little')
-            i += 3
         
         first_frag = bool(flags & self.FLAG_FIRST_FRAG)
         last_frag = bool(flags & self.FLAG_LAST_FRAG)
@@ -431,7 +431,6 @@ class ImageReassembler:
         if 'meta' not in state: state['meta'] = []
         
         if sysv is not None: state['system_voltage'] = sysv
-        if als is not None: state['ambient_light_lux'] = als
         
         if first_frag:
             state['total_size'] = offset
@@ -517,8 +516,13 @@ class ImageReassembler:
         print(f"[{dev_eui}:{sense_time}] Progress: {reassembled_offset}/{total} ({percent:.2f}%) [Max: {max_reached}/{total} ({max_percent:.2f}%)] {info}")
 
         # Always check for finalization using the actual contiguous offset
-        await self._finalize_image(r, dev_eui, app_id, epoch, sense_time, buffer_key, 
-                                   reassembled_offset, total, last_frag, completed_key, state_key, started_key, state)
+        if is_video:
+            if total and reassembled_offset >= total:
+                await self._finalize_video(r, dev_eui, app_id, epoch, sense_time, buffer_key,
+                                           total, completed_key, state_key, started_key, state)
+        else:
+            await self._finalize_image(r, dev_eui, app_id, epoch, sense_time, buffer_key,
+                                       reassembled_offset, total, last_frag, completed_key, state_key, started_key, state)
 
     async def _start_sessions(self, r, prefix, dev_eui, app_id, epoch, num_sessions):
         """Create the virtual sessions for this image and hand them to the camera (fPort 5)."""
@@ -675,7 +679,6 @@ class ImageReassembler:
                     'app_id': app_id,
                     'sense_time': sense_time,
                     'system_voltage': state.get('system_voltage'),
-                    'ambient_light_lux': state.get('ambient_light_lux'),
                     'det': state.get('det'),
                     'transfer_sec': transfer_sec,
                     'image_bytes': total_size,
@@ -701,6 +704,31 @@ class ImageReassembler:
         # Notify streamers last (even if the image is partial) so that on completion
         # upload:ready already exists when mjpeg-streamer's doUpload() runs GETDEL on it
         await r.publish(f"EdgeEye:updated:{dev_eui}", "updated")
+
+    async def _finalize_video(self, r, dev_eui, app_id, epoch, sense_time, buffer_key,
+                              total_size, completed_key, state_key, started_key, state):
+        video = await r.get(buffer_key)
+        if video is None or len(video) < total_size:
+            return
+        video = video[:total_size]
+        transfer_sec, bytes_per_sec = self._transfer_timing(await r.getdel(started_key), total_size)
+        video_key = f"ImageToRtsp:{dev_eui}:video:{epoch}"
+        meta_key = f"{video_key}:upload:ready"
+        meta = {
+            'app_id': app_id, 'sense_time': sense_time,
+            'system_voltage': state.get('system_voltage'),
+            'transfer_sec': transfer_sec, 'video_bytes': total_size,
+            'bytes_per_sec': bytes_per_sec,
+        }
+        await r.set(video_key, video, ex=86400)
+        await r.set(meta_key, json.dumps(meta), ex=86400)
+        await r.set(completed_key, 1, ex=86400)
+        if self.sessions is not None:
+            await self.sessions.release(r, dev_eui)
+        await self._send_downlink(app_id, dev_eui, 4, epoch.to_bytes(5, 'little'))
+        await r.delete(buffer_key, state_key)
+        print(f"[{dev_eui}] Video reassembly complete: {total_size} bytes")
+        await r.publish(f"EdgeEye:updated:{dev_eui}", f"video:{epoch}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="EdgeEye Image Reassembler (Chirpstack v4 MQTT)")
