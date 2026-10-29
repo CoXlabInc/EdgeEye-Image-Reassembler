@@ -4,6 +4,8 @@ import os from 'os';
 import http from 'http';
 import fs from 'fs/promises';
 import path from 'path';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import sharp from 'sharp';
 
 import { Command } from 'commander';
@@ -354,6 +356,30 @@ async function doUpload(device) {
     }
 }
 
+const execFileAsync = promisify(execFile);
+
+// First frame of the MP4 as a JPEG for IOTOWN's `{videoField}_thumbnail`, or null.
+// ffmpeg reads a temp file since the moov box may follow the media data (no pipe).
+async function makeVideoThumbnail(device, video) {
+    let tmpDir;
+    try {
+        tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'edgeeye-'));
+        const input = path.join(tmpDir, 'video.mp4');
+        const output = path.join(tmpDir, 'thumbnail.jpg');
+        await fs.writeFile(input, video);
+        await execFileAsync('ffmpeg', [
+            '-nostdin', '-hide_banner', '-loglevel', 'error',
+            '-i', input, '-frames:v', '1', '-q:v', '4', '-update', '1', output,
+        ], { timeout: 30000 });
+        return await fs.readFile(output);
+    } catch (e) {
+        console.error(`[${device}] Video thumbnail failed, uploading without it: ${e.message}`);
+        return null;
+    } finally {
+        if (tmpDir) await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    }
+}
+
 async function doUploadVideo(device, epoch) {
     const videoKey = `ImageToRtsp:${device}:video:${epoch}`;
     const metaRaw = await redisClient.getDel(`${videoKey}:upload:ready`);
@@ -378,15 +404,17 @@ async function doUploadVideo(device, epoch) {
     for (const key of ['system_voltage', 'transfer_sec', 'video_bytes', 'bytes_per_sec']) {
         if (meta[key] != null) data[key] = meta[key];
     }
+    const thumbnail = await makeVideoThumbnail(device, video);
     const form = new FormData();
     form.append('video', new Blob([video], { type: 'video/mp4' }), 'video.mp4');
+    if (thumbnail) form.append('video_thumbnail', new Blob([thumbnail], { type: 'image/jpeg' }), 'video_thumbnail.jpg');
     form.append('deviceId', device);
     appendTimestamp(form, device, senseTime);
     form.append('data', JSON.stringify(data));
     const headers = getUploadHeaders(meta.app_id) ? JSON.parse(getUploadHeaders(meta.app_id)) : {};
     const resp = await fetch(url, { method: 'POST', headers, body: form });
     if (!resp.ok) console.error(`[${device}] Video upload failed (${resp.status}): ${await resp.text()}`);
-    else console.log(`[${device}] Video uploaded to ${url}`);
+    else console.log(`[${device}] Video uploaded to ${url}${thumbnail ? ' with thumbnail' : ''}`);
 }
 
 async function gatherDeviceData() {

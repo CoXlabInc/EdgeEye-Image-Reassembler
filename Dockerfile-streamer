@@ -1,9 +1,10 @@
 FROM node:22-alpine
 
-# Install fonts for timestamp overlay
+# Install fonts for timestamp overlay and ffmpeg for video thumbnails
 RUN apk add --no-cache \
     font-terminus font-inconsolata font-dejavu font-noto \
-    font-noto-cjk font-awesome font-noto-extra
+    font-noto-cjk font-awesome font-noto-extra \
+    ffmpeg
 
 WORKDIR /root/
 

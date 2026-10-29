@@ -56,7 +56,7 @@ Bit `0x08` is ignored; no ambient-light bytes are parsed. Legacy ALS payloads ar
 
 ### Uplink — MP4 Fragment (FPORT 6)
 
-The same header and retransmission protocol applies to a single complete MP4 file, with a maximum size of 16,777,215 bytes. `FLAG_OBJDET` is invalid. The device must use a unique reassembly ID per transfer and send only one image or video at a time. The ID retains the image protocol's timestamp semantics. Completed video is stored and uploaded byte-for-byte; it is not shown in the MJPEG stream.
+The same header and retransmission protocol applies to a single complete MP4 file, with a maximum size of 16,777,215 bytes. `FLAG_OBJDET` is invalid. The device must use a unique reassembly ID per transfer and send only one image or video at a time. The ID retains the image protocol's timestamp semantics. Completed video is stored and uploaded byte-for-byte; it is not shown in the MJPEG stream. For upload, the streamer extracts the first frame with ffmpeg and sends it as `video_thumbnail` in the same request (IOTOWN's `{videoField}_thumbnail` rule); if extraction fails, the video is uploaded alone.
 
 ### Uplink — Object Detection (FPORT 1, FLAG_OBJDET)
 
@@ -120,7 +120,7 @@ Adds up to 2 extra LoRaWAN sessions: Reassembly ID (5B) + Session0 DevAddr/NwkSK
 
 - Docker build only. No local npm/pip test runners, linters, or type checkers.
 - `Dockerfile-reassembler` base: `python:3-alpine` (pip deps: redis, pillow, numpy, pyjwt, paho-mqtt)
-- `Dockerfile-streamer` base: `node:22-alpine` (npm deps: commander, sharp, redis)
+- `Dockerfile-streamer` base: `node:22-alpine` (apk: fonts, ffmpeg; npm deps: commander, sharp, redis)
 - MJPEG streamer requires `--experimental-json-modules` flag (in `package.json` `start` script)
 
 ## Caveats

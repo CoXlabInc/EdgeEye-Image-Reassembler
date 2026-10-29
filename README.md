@@ -151,7 +151,7 @@ If `UPLOAD_URL` is set, the system performs a `multipart/form-data` POST request
     - `bytes_per_sec`: Transfer rate, `image_bytes / transfer_sec`.
     - `det`: Object detection list (optional, mode-dependent).
 
-MP4 uploads use the same endpoint, `deviceId`, `_timestamp`, and `data` fields, but replace `snap` with `video` (filename `video.mp4`, content type `video/mp4`). The data contains `system_voltage`, `transfer_sec`, `video_bytes`, and `bytes_per_sec` when available. Video bytes are not re-encoded or overlaid.
+MP4 uploads use the same endpoint, `deviceId`, `_timestamp`, and `data` fields, but replace `snap` with `video` (filename `video.mp4`, content type `video/mp4`). The data contains `system_voltage`, `transfer_sec`, `video_bytes`, and `bytes_per_sec` when available. Video bytes are not re-encoded or overlaid. The streamer also extracts the first frame with ffmpeg as a JPEG at the video's own resolution and sends it in the same request as `video_thumbnail` (filename `video_thumbnail.jpg`, content type `image/jpeg`), which IOTOWN shows as the video's thumbnail. If extraction fails, the video is uploaded without it. Thumbnails are not written to `SAVE_DIR`.
 
 **`DET_UPLOAD_MODE` behavior:**
 - **1**: Detection data is included in the `data` field of a single upload with `snap`.
